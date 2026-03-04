@@ -1,0 +1,70 @@
+# multifuzz
+
+Multi-engine fuzzing orchestrator for Rust. Runs AFL++, honggfuzz, and libfuzzer in parallel with automatic corpus synchronization and crash collection.
+
+## Usage
+
+Write a fuzz harness using the `fuzz!` macro:
+
+```rust
+use multifuzz::fuzz;
+
+fn main() {
+    fuzz!(|data: &[u8]| {
+        // test your code here
+    });
+}
+```
+
+Structured input via `Arbitrary` is also supported:
+
+```rust
+fuzz!(|data: MyStruct| {
+    // data is deserialized automatically
+});
+```
+
+## Prerequisites
+
+Install the fuzzing toolchains:
+
+```sh
+cargo install cargo-afl
+cargo install honggfuzz
+```
+
+## CLI
+
+From your harness crate directory:
+
+```sh
+# Build all fuzzer binaries (AFL++, honggfuzz, libfuzzer)
+cargo run --manifest-path path/to/multifuzz/Cargo.toml -- build
+
+# Run fuzzing with 3 parallel jobs across all engines
+cargo run --manifest-path path/to/multifuzz/Cargo.toml -- fuzz my_target -j 3 -i corpus/ -o output/
+
+# Replay a crash or directory of inputs
+cargo run --manifest-path path/to/multifuzz/Cargo.toml -- run my_target -i output/my_target/crashes/ -r
+```
+
+### Options
+
+| Flag | Description |
+|---|---|
+| `-j NUM` | Number of concurrent jobs (default: 1) |
+| `-i DIR` | Corpus directory |
+| `-o DIR` | Output directory (default: `./output`) |
+| `-x FILE` | Dictionary file (repeatable) |
+| `-t SECS` | Timeout per run |
+| `--no-afl` | Disable AFL++ |
+| `--no-honggfuzz` | Disable honggfuzz |
+| `--no-libfuzzer` | Disable libfuzzer |
+
+## How it works
+
+Jobs are distributed across engines automatically. Corpus files are synchronized between engines every 10 minutes using hash-based deduplication. Crashes from all engines are collected into a unified `crashes/` directory.
+
+## License
+
+Apache-2.0

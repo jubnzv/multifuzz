@@ -1,0 +1,30 @@
+# Copyright (c) Mysten Labs, Inc.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "multifuzz"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[features]
+default = ["cli"]
+cli = ["clap", "anyhow", "glob", "libc", "twox-hash"]
+afl = ["dep:afl"]
+honggfuzz = ["dep:honggfuzz"]
+libfuzzer = ["dep:libfuzzer-sys"]
+
+[dependencies]
+afl = { version = "0.15", default-features = false, optional = true }
+honggfuzz = { version = "0.5", optional = true }
+libfuzzer-sys = { version = "0.4", optional = true }
+arbitrary = { version = "1", optional = true }
+clap = { version = "4", features = ["derive"], optional = true }
+anyhow = { version = "1", optional = true }
+glob = { version = "0.3", optional = true }
+libc = { version = "0.2", optional = true }
+twox-hash = { version = "2", optional = true }
+
+[[bin]]
+name = "multifuzz"
+required-features = ["cli"]

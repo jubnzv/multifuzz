@@ -1,0 +1,11 @@
+[package]
+name = "example-crash"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+multifuzz = { path = ".." }
+
+[[bin]]
+name = "example_crash"
+path = "src/bin/example_crash.rs"
