@@ -36,6 +36,7 @@ pub struct Dashboard {
     engines: Vec<EngineInfo>,
     /// Crash counts at startup, subtracted from displayed values.
     baseline_crashes: Vec<u64>,
+    syncing: bool,
 }
 
 // ── dashboard ────────────────────────────────────────────────────────────
@@ -49,11 +50,16 @@ impl Dashboard {
             output_target: output_target.to_string(),
             engines,
             baseline_crashes,
+            syncing: false,
         }
     }
 
     /// Snapshot current crash counts as the baseline so the dashboard only
     /// shows crashes from this session.
+    pub fn set_syncing(&mut self, syncing: bool) {
+        self.syncing = syncing;
+    }
+
     pub fn record_baseline(&mut self) {
         for (i, engine) in self.engines.iter().enumerate() {
             let es = match engine.kind {
@@ -242,6 +248,9 @@ impl Dashboard {
         let _ = writeln!(buf, " Runtime : {}", fmt_duration(elapsed));
         let _ = writeln!(buf, " Corpus  : {} files (shared)", corpus_count);
         let _ = writeln!(buf, " Crashes : {total_crashes}");
+        if self.syncing {
+            let _ = writeln!(buf, " \x1b[1;33m⟳ syncing corpus...\x1b[0m");
+        }
         let _ = writeln!(buf);
 
         // Table header.

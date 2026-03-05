@@ -127,8 +127,11 @@ impl Fuzz {
 
             // ── corpus sync (every 10 minutes) ─────────────────────────
             if last_sync_time.elapsed().as_secs() > 10 * 60 {
+                dashboard.set_syncing(true);
+                dashboard.refresh(&mut processes);
                 last_synced_created_time = self.sync_corpus(last_synced_created_time)?;
                 last_sync_time = Instant::now();
+                dashboard.set_syncing(false);
             }
 
             // ── dashboard refresh + liveness check ──────────────────────
