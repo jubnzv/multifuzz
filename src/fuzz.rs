@@ -1,3 +1,4 @@
+use crate::ui::{Dashboard, EngineInfo, EngineKind};
 use crate::{Build, Fuzz};
 use anyhow::{anyhow, Context, Result};
 use glob::glob;
@@ -110,31 +111,12 @@ impl Fuzz {
             self.merged_dict = Some(merge_dicts(&self.dictionaries, &self.output_target())?);
         }
 
-        let mut processes = self.spawn_fuzzers()?;
+        let (mut processes, engines) = self.spawn_fuzzers()?;
+        let dashboard = Dashboard::new(&self.target, &self.output_target(), engines);
 
         let crash_path = Path::new(&crash_dir);
         let mut last_synced_created_time: Option<SystemTime> = None;
         let mut last_sync_time = Instant::now();
-
-        eprintln!("\nFuzzing {}...", self.target);
-        eprintln!("See live information:");
-        if self.afl_enabled() {
-            let (afl_jobs, _, _) = self.allocate_jobs();
-            for i in 0..afl_jobs {
-                let name = if i == 0 {
-                    "afl.log".to_string()
-                } else {
-                    format!("afl_{i}.log")
-                };
-                eprintln!("  tail -f {}/logs/{name}", self.output_target());
-            }
-        }
-        if self.honggfuzz_enabled() {
-            eprintln!("  tail -f {}/logs/honggfuzz.log", self.output_target());
-        }
-        if self.libfuzzer_enabled() {
-            eprintln!("  tail -f {}/logs/libfuzzer.log", self.output_target());
-        }
 
         loop {
             thread::sleep(Duration::from_secs(1));
@@ -148,11 +130,8 @@ impl Fuzz {
                 last_sync_time = Instant::now();
             }
 
-            // ── liveness check ──────────────────────────────────────────
-            if processes
-                .iter_mut()
-                .all(|p| p.try_wait().unwrap_or(None).is_some())
-            {
+            // ── dashboard refresh + liveness check ──────────────────────
+            if dashboard.refresh(&mut processes) {
                 stop_fuzzers(&mut processes)?;
                 return Ok(());
             }
@@ -267,33 +246,52 @@ impl Fuzz {
 
     // ── spawning ────────────────────────────────────────────────────────
 
-    fn spawn_fuzzers(&self) -> Result<Vec<process::Child>> {
+    fn spawn_fuzzers(&self) -> Result<(Vec<process::Child>, Vec<EngineInfo>)> {
         if self.no_afl && self.no_honggfuzz && !self.libfuzzer_enabled() {
             return Err(anyhow!("Pick at least one fuzzer"));
         }
 
         let mut handles = vec![];
+        let mut engines = vec![];
         let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
 
         let (afl_jobs, honggfuzz_jobs, libfuzzer_jobs) = self.allocate_jobs();
 
         if afl_jobs > 0 {
             fs::create_dir_all(format!("{}/afl", self.output_target()))?;
+            let start = handles.len();
             self.spawn_afl(&cargo, afl_jobs, &mut handles)?;
-            eprintln!("    Launched afl ({afl_jobs} instances)");
+            engines.push(EngineInfo {
+                name: format!("AFL++ ({afl_jobs}P)"),
+                kind: EngineKind::Afl,
+                process_indices: (start..handles.len()).collect(),
+            });
+            eprintln!("    Launched AFL++ ({afl_jobs} instances)");
         }
 
         if honggfuzz_jobs > 0 {
+            let start = handles.len();
             self.spawn_honggfuzz(&cargo, honggfuzz_jobs, &mut handles)?;
+            engines.push(EngineInfo {
+                name: format!("honggfuzz ({honggfuzz_jobs}T)"),
+                kind: EngineKind::Honggfuzz,
+                process_indices: (start..handles.len()).collect(),
+            });
             eprintln!("    Launched honggfuzz ({honggfuzz_jobs} threads)");
         }
 
         if libfuzzer_jobs > 0 {
+            let start = handles.len();
             self.spawn_libfuzzer(libfuzzer_jobs, &mut handles)?;
+            engines.push(EngineInfo {
+                name: format!("libfuzzer ({libfuzzer_jobs}F)"),
+                kind: EngineKind::Libfuzzer,
+                process_indices: (start..handles.len()).collect(),
+            });
             eprintln!("    Launched libfuzzer ({libfuzzer_jobs} workers)");
         }
 
-        Ok(handles)
+        Ok((handles, engines))
     }
 
     /// Allocate jobs between AFL++, honggfuzz and libfuzzer.
