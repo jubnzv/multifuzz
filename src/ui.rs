@@ -34,17 +34,34 @@ pub struct Dashboard {
     target: String,
     output_target: String,
     engines: Vec<EngineInfo>,
+    /// Crash counts at startup, subtracted from displayed values.
+    baseline_crashes: Vec<u64>,
 }
 
 // ── dashboard ────────────────────────────────────────────────────────────
 
 impl Dashboard {
     pub fn new(target: &str, output_target: &str, engines: Vec<EngineInfo>) -> Self {
+        let baseline_crashes = vec![0; engines.len()];
         Self {
             start_time: Instant::now(),
             target: target.to_string(),
             output_target: output_target.to_string(),
             engines,
+            baseline_crashes,
+        }
+    }
+
+    /// Snapshot current crash counts as the baseline so the dashboard only
+    /// shows crashes from this session.
+    pub fn record_baseline(&mut self) {
+        for (i, engine) in self.engines.iter().enumerate() {
+            let es = match engine.kind {
+                EngineKind::Afl => self.read_afl_stats(engine),
+                EngineKind::Honggfuzz => self.read_honggfuzz_stats(),
+                EngineKind::Libfuzzer => self.read_libfuzzer_stats(),
+            };
+            self.baseline_crashes[i] = es.crashes;
         }
     }
 
@@ -54,7 +71,7 @@ impl Dashboard {
         let mut all_dead = true;
         let mut stats: Vec<EngineStats> = Vec::with_capacity(self.engines.len());
 
-        for engine in &self.engines {
+        for (i, engine) in self.engines.iter().enumerate() {
             let alive = engine
                 .process_indices
                 .iter()
@@ -69,6 +86,7 @@ impl Dashboard {
                 EngineKind::Libfuzzer => self.read_libfuzzer_stats(),
             };
             es.alive = alive;
+            es.crashes = es.crashes.saturating_sub(self.baseline_crashes[i]);
             stats.push(es);
         }
 

@@ -112,7 +112,8 @@ impl Fuzz {
         }
 
         let (mut processes, engines) = self.spawn_fuzzers()?;
-        let dashboard = Dashboard::new(&self.target, &self.output_target(), engines);
+        let mut dashboard = Dashboard::new(&self.target, &self.output_target(), engines);
+        dashboard.record_baseline();
 
         let crash_path = Path::new(&crash_dir);
         let mut last_synced_created_time: Option<SystemTime> = None;
