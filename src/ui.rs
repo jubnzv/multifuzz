@@ -154,10 +154,13 @@ impl Dashboard {
             }
         }
         if let Some(v) = rfind_after(&tail, "Corpus Size : ") {
+            // "2,666, max: ..." — grab everything up to first non-digit/non-comma
             let clean = strip_ansi_inline(v);
-            if let Some(num) = clean.split(',').next() {
-                stats.corpus_count = parse_num(num.trim()) as u64;
-            }
+            let num: String = clean
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',')
+                .collect();
+            stats.corpus_count = parse_num(&num) as u64;
         }
 
         stats
