@@ -229,8 +229,18 @@ impl Fuzz {
             })
             .collect();
 
+        let max_len = self.max_input_size as u64;
+
         for file in valid_files {
             if file.file_name().is_some() {
+                // Skip inputs that exceed max_input_size — honggfuzz will
+                // abort if it encounters them, and oversized inputs are
+                // unlikely to be useful for the other engines either.
+                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+                if file_len > max_len {
+                    continue;
+                }
+
                 // Copy to honggfuzz bridge queue
                 if self.honggfuzz_enabled() {
                     let queue_path = format!(
@@ -486,6 +496,55 @@ impl Fuzz {
         } else {
             format!("-w{}", self.merged_dict.as_ref().unwrap().display())
         };
+
+        // Purge any corpus/queue files exceeding max_input_size so honggfuzz
+        // doesn't abort on oversized inputs left by other engines.
+        let max_len = self.max_input_size as u64;
+        let mut oversized: Vec<PathBuf> = Vec::new();
+        for dir in [
+            format!("{}/queue", self.output_target()),
+            format!("{}/honggfuzz/corpus", self.output_target()),
+        ] {
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if entry.metadata().map(|m| m.len()).unwrap_or(0) > max_len {
+                        oversized.push(entry.path());
+                    }
+                }
+            }
+        }
+        if !oversized.is_empty() {
+            eprintln!(
+                "    Warning: {} file(s) exceed max_input_size ({} bytes) and will crash honggfuzz.",
+                oversized.len(),
+                self.max_input_size,
+            );
+            // Group by parent directory for a concise summary.
+            let mut by_dir: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for path in &oversized {
+                let dir = path
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                *by_dir.entry(dir).or_default() += 1;
+            }
+            for (dir, count) in &by_dir {
+                eprintln!("      {count} file(s) in {dir}");
+            }
+            eprint!("    Remove them? [Y/n] ");
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            let answer = answer.trim().to_lowercase();
+            if answer.is_empty() || answer == "y" || answer == "yes" {
+                for path in &oversized {
+                    let _ = fs::remove_file(path);
+                }
+                eprintln!("    Removed {} oversized file(s).", oversized.len());
+            } else {
+                eprintln!("    Skipped removal. Honggfuzz may abort on oversized inputs.");
+            }
+        }
 
         // The `script` invocation is a trick to get the correct TTY output for
         // honggfuzz (it requires a valid terminal).
