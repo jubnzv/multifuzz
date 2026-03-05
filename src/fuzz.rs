@@ -119,7 +119,11 @@ impl Fuzz {
         eprintln!("\nFuzzing {}...", self.target);
         eprintln!("See live information:");
         if self.afl_enabled() {
-            eprintln!("  tail -f {}/logs/afl.log", self.output_target());
+            let (afl_jobs, _, _) = self.allocate_jobs();
+            for i in 0..afl_jobs {
+                let name = if i == 0 { "afl.log".to_string() } else { format!("afl_{i}.log") };
+                eprintln!("  tail -f {}/logs/{name}", self.output_target());
+            }
         }
         if self.honggfuzz_enabled() {
             eprintln!("  tail -f {}/logs/honggfuzz.log", self.output_target());
@@ -394,15 +398,14 @@ impl Fuzz {
             };
 
             let log_destination = || -> Stdio {
-                match job_num {
-                    0 => File::create(format!("{}/logs/afl.log", self.output_target()))
-                        .unwrap()
-                        .into(),
-                    1 => File::create(format!("{}/logs/afl_1.log", self.output_target()))
-                        .unwrap()
-                        .into(),
-                    _ => Stdio::null(),
-                }
+                let name = if job_num == 0 {
+                    "afl.log".to_string()
+                } else {
+                    format!("afl_{job_num}.log")
+                };
+                File::create(format!("{}/logs/{name}", self.output_target()))
+                    .unwrap()
+                    .into()
             };
 
             let final_sync = if job_num == 0 {
