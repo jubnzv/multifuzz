@@ -2,6 +2,8 @@
 
 Multi-engine fuzzing orchestrator for Rust. Runs AFL++, honggfuzz, and libfuzzer in parallel with automatic corpus synchronization and crash collection.
 
+![screenshot](./docs/img/screenshot.png)
+
 ## Usage
 
 Write a fuzz harness using the `fuzz!` macro:
