@@ -401,6 +401,8 @@ impl Fuzz {
                 None => String::new(),
             };
 
+            let max_len_flag = format!("-G{}", self.max_input_size);
+
             let log_destination = || -> Stdio {
                 let name = if job_num == 0 {
                     "afl.log".to_string()
@@ -436,6 +438,7 @@ impl Fuzz {
                             cmplog,
                             mopt,
                             &timeout_flag,
+                            &max_len_flag,
                         ]
                         .iter()
                         .filter(|a| !a.is_empty()),
@@ -510,9 +513,11 @@ impl Fuzz {
                          -o{}/honggfuzz/corpus \
                          -n{honggfuzz_jobs} \
                          --dynamic_input={}/queue \
+                         -F{} \
                          {timeout_flag} {dict_flag}",
                         self.output_target(),
                         self.output_target(),
+                        self.max_input_size,
                     ),
                 )
                 .stdin(Stdio::null())
@@ -548,6 +553,7 @@ impl Fuzz {
             "-ignore_crashes=1".to_string(),
             "-ignore_ooms=1".to_string(),
             "-ignore_timeouts=1".to_string(),
+            format!("-max_len={}", self.max_input_size),
         ];
 
         if let Some(t) = self.timeout {

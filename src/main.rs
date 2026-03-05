@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 pub const DEFAULT_OUTPUT_DIR: &str = "./output";
+pub const DEFAULT_MAX_INPUT_SIZE: u32 = 8192;
 
 #[derive(Parser)]
 #[clap(
@@ -73,6 +74,9 @@ pub struct Fuzz {
     /// Disable libfuzzer
     #[clap(long = "no-libfuzzer", action)]
     no_libfuzzer: bool,
+    /// Maximum input size in bytes
+    #[clap(long = "max-input-size", value_name = "BYTES", default_value_t = DEFAULT_MAX_INPUT_SIZE)]
+    max_input_size: u32,
 }
 
 #[derive(clap::Args)]
