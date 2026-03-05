@@ -78,6 +78,9 @@ pub struct Fuzz {
     /// Maximum input size in bytes
     #[clap(long = "max-input-size", value_name = "BYTES", default_value_t = DEFAULT_MAX_INPUT_SIZE)]
     max_input_size: u32,
+    /// Corpus sync interval in minutes
+    #[clap(long = "sync-interval", value_name = "MINS", default_value_t = 60)]
+    sync_interval: u64,
 }
 
 #[derive(clap::Args)]

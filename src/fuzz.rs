@@ -126,7 +126,7 @@ impl Fuzz {
             self.collect_crashes(crash_path)?;
 
             // ── corpus sync (every 10 minutes) ─────────────────────────
-            if last_sync_time.elapsed().as_secs() > 10 * 60 {
+            if last_sync_time.elapsed().as_secs() > self.sync_interval * 60 {
                 dashboard.set_syncing(true);
                 dashboard.refresh(&mut processes);
                 last_synced_created_time = self.sync_corpus(last_synced_created_time)?;

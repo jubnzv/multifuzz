@@ -62,10 +62,12 @@ cargo run --manifest-path path/to/multifuzz/Cargo.toml -- run my_target -i outpu
 | `--no-afl` | Disable AFL++ |
 | `--no-honggfuzz` | Disable honggfuzz |
 | `--no-libfuzzer` | Disable libfuzzer |
+| `--max-input-size BYTES` | Maximum input size in bytes (default: 8192) |
+| `--sync-interval MINS` | Corpus sync interval in minutes (default: 60) |
 
 ## How it works
 
-Jobs are distributed across engines automatically. Corpus files are synchronized between engines every 10 minutes using hash-based deduplication. Crashes from all engines are collected into a unified `crashes/` directory.
+Jobs are distributed across engines automatically. Corpus files are synchronized between engines periodically (default: every 60 minutes, configurable via `--sync-interval`) using hash-based deduplication. Crashes from all engines are collected into a unified `crashes/` directory.
 
 ## License
 
