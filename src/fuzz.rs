@@ -367,6 +367,28 @@ impl Fuzz {
             vec![format!("-x{}", merged.display())]
         };
 
+        // When AFL++ already has a queue from a previous run, use a minimal
+        // seed directory instead of the (potentially huge) shared corpus.
+        // AFL_AUTORESUME makes AFL++ reuse its existing queue, so `-i` only
+        // matters for the very first import — a single dummy seed is enough.
+        let afl_queue_dir = format!("{}/afl/mainaflfuzzer/queue", self.output_target());
+        let afl_can_resume = Path::new(&afl_queue_dir)
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
+
+        let afl_input_dir = if afl_can_resume {
+            let minimal = format!("{}/afl/_seed", self.output_target());
+            fs::create_dir_all(&minimal)?;
+            let marker = format!("{minimal}/init");
+            if !Path::new(&marker).exists() {
+                File::create(&marker)?.write_all(b"00000000\n")?;
+            }
+            minimal
+        } else {
+            corpus.clone()
+        };
+
         for job_num in 0..afl_jobs {
             let is_main = job_num == 0;
 
@@ -376,9 +398,9 @@ impl Fuzz {
                 format!("-Ssecondaryfuzzer{job_num}")
             };
 
-            // Only the main instance syncs from the shared corpus (honggfuzz bridge)
-            let shared_corpus_flag = if !self.no_honggfuzz && job_num == 0 {
-                format!("-F{corpus}")
+            // Only the main instance syncs from honggfuzz's output corpus
+            let honggfuzz_sync_flag = if self.honggfuzz_enabled() && job_num == 0 {
+                format!("-F{}/honggfuzz/corpus", self.output_target())
             } else {
                 String::new()
             };
@@ -441,10 +463,10 @@ impl Fuzz {
                             "afl",
                             "fuzz",
                             &fuzzer_name,
-                            &format!("-i{corpus}"),
+                            &format!("-i{afl_input_dir}"),
                             &format!("-p{power_schedule}"),
                             &format!("-o{}/afl", self.output_target()),
-                            &shared_corpus_flag,
+                            &honggfuzz_sync_flag,
                             &libfuzzer_sync_flag,
                             old_queue,
                             cmplog,
@@ -466,7 +488,6 @@ impl Fuzz {
                     .env("AFL_DISABLE_TRIM", "1")
                     .env("AFL_NO_WARN_INSTABILITY", "1")
                     .env("AFL_FUZZER_STATS_UPDATE_INTERVAL", "10")
-                    .env("AFL_IMPORT_FIRST", "1")
                     .env(final_sync, "1")
                     .env("AFL_IGNORE_SEED_PROBLEMS", "1")
                     .stdout(log_destination())
