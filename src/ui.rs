@@ -3,7 +3,7 @@ use std::{
     fs,
     io::{self, Read, Seek, SeekFrom, Write},
     process,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 // ── types ────────────────────────────────────────────────────────────────
@@ -37,6 +37,7 @@ pub struct Dashboard {
     /// Crash counts at startup, subtracted from displayed values.
     baseline_crashes: Vec<u64>,
     syncing: bool,
+    last_sync: Option<String>,
 }
 
 // ── dashboard ────────────────────────────────────────────────────────────
@@ -51,12 +52,23 @@ impl Dashboard {
             engines,
             baseline_crashes,
             syncing: false,
+            last_sync: None,
         }
     }
 
     /// Snapshot current crash counts as the baseline so the dashboard only
     /// shows crashes from this session.
     pub fn set_syncing(&mut self, syncing: bool) {
+        if !syncing && self.syncing {
+            let secs = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let h = (secs % 86400) / 3600;
+            let m = (secs % 3600) / 60;
+            let s = secs % 60;
+            self.last_sync = Some(format!("{h:02}:{m:02}:{s:02}"));
+        }
         self.syncing = syncing;
     }
 
@@ -246,6 +258,8 @@ impl Dashboard {
             "─".repeat(60usize.saturating_sub(header.len()))
         );
         let _ = writeln!(buf, " Runtime : {}", fmt_duration(elapsed));
+        let last_sync_str = self.last_sync.as_deref().unwrap_or("—");
+        let _ = writeln!(buf, " Last sync: {last_sync_str}");
         let _ = writeln!(buf, " Corpus  : {} files (shared)", corpus_count);
         let _ = writeln!(buf, " Crashes : {total_crashes}");
         if self.syncing {
