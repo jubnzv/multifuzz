@@ -121,7 +121,11 @@ impl Fuzz {
         if self.afl_enabled() {
             let (afl_jobs, _, _) = self.allocate_jobs();
             for i in 0..afl_jobs {
-                let name = if i == 0 { "afl.log".to_string() } else { format!("afl_{i}.log") };
+                let name = if i == 0 {
+                    "afl.log".to_string()
+                } else {
+                    format!("afl_{i}.log")
+                };
                 eprintln!("  tail -f {}/logs/{name}", self.output_target());
             }
         }
