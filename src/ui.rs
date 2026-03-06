@@ -27,6 +27,8 @@ struct EngineStats {
     corpus_count: u64,
     crashes: u64,
     alive: bool,
+    /// Engine is loading/importing corpus files.
+    loading: bool,
 }
 
 pub struct Dashboard {
@@ -38,6 +40,8 @@ pub struct Dashboard {
     baseline_crashes: Vec<u64>,
     syncing: bool,
     last_sync: Option<String>,
+    /// When an engine entered the loading state (for elapsed timer).
+    loading_since: Option<Instant>,
 }
 
 // ── dashboard ────────────────────────────────────────────────────────────
@@ -53,6 +57,7 @@ impl Dashboard {
             baseline_crashes,
             syncing: false,
             last_sync: None,
+            loading_since: None,
         }
     }
 
@@ -85,9 +90,10 @@ impl Dashboard {
 
     /// Read stats, redraw the dashboard. Returns `true` when every process has
     /// exited (i.e. the caller should stop the loop).
-    pub fn refresh(&self, processes: &mut [process::Child]) -> bool {
+    pub fn refresh(&mut self, processes: &mut [process::Child]) -> bool {
         let mut all_dead = true;
         let mut stats: Vec<EngineStats> = Vec::with_capacity(self.engines.len());
+        let mut any_loading = false;
 
         for (i, engine) in self.engines.iter().enumerate() {
             let alive = engine
@@ -105,7 +111,17 @@ impl Dashboard {
             };
             es.alive = alive;
             es.crashes = es.crashes.saturating_sub(self.baseline_crashes[i]);
+            if es.loading {
+                any_loading = true;
+            }
             stats.push(es);
+        }
+
+        // Track when loading started for the elapsed timer.
+        if any_loading && self.loading_since.is_none() {
+            self.loading_since = Some(Instant::now());
+        } else if !any_loading {
+            self.loading_since = None;
         }
 
         let engines_with_corpus = stats.iter().filter(|s| s.corpus_count > 0).count() as u64;
@@ -128,6 +144,7 @@ impl Dashboard {
             corpus_count: 0,
             crashes: 0,
             alive: false,
+            loading: false,
         };
 
         // The engine name encodes the instance dir; for the aggregate view we
@@ -170,6 +187,7 @@ impl Dashboard {
             corpus_count: 0,
             crashes: 0,
             alive: false,
+            loading: false,
         };
 
         let log_path = format!("{}/logs/honggfuzz.log", self.output_target);
@@ -199,6 +217,11 @@ impl Dashboard {
             stats.corpus_count = parse_num(&num) as u64;
         }
 
+        // Detect when honggfuzz is busy loading dynamic input files after a sync.
+        if stats.execs_per_sec == 0.0 && tail.contains("Loading dynamic input file") {
+            stats.loading = true;
+        }
+
         stats
     }
 
@@ -209,6 +232,7 @@ impl Dashboard {
             corpus_count: 0,
             crashes: 0,
             alive: false,
+            loading: false,
         };
 
         let log_path = format!("{}/logs/libfuzzer.log", self.output_target);
@@ -275,7 +299,26 @@ impl Dashboard {
         );
         let _ = writeln!(buf, " {}", "─".repeat(58));
 
+        let spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let spinner_idx = elapsed.as_secs() as usize % spinner_frames.len();
+        let spinner = spinner_frames[spinner_idx];
+
         for (engine, es) in self.engines.iter().zip(stats.iter()) {
+            if es.loading && es.alive {
+                let loading_elapsed = self
+                    .loading_since
+                    .map(|t| t.elapsed())
+                    .unwrap_or_default();
+                let ls = loading_elapsed.as_secs();
+                let _ = writeln!(
+                    buf,
+                    " {:<20} \x1b[1;33m{spinner} syncing corpus ({:02}:{:02})\x1b[0m",
+                    engine.name,
+                    ls / 60,
+                    ls % 60,
+                );
+                continue;
+            }
             let status = if es.alive {
                 "\x1b[32malive\x1b[0m"
             } else {
