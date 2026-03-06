@@ -305,10 +305,7 @@ impl Dashboard {
 
         for (engine, es) in self.engines.iter().zip(stats.iter()) {
             if es.loading && es.alive {
-                let loading_elapsed = self
-                    .loading_since
-                    .map(|t| t.elapsed())
-                    .unwrap_or_default();
+                let loading_elapsed = self.loading_since.map(|t| t.elapsed()).unwrap_or_default();
                 let ls = loading_elapsed.as_secs();
                 let _ = writeln!(
                     buf,
