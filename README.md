@@ -35,22 +35,28 @@ cargo install cargo-afl
 cargo install honggfuzz
 ```
 
+## Installation
+
+```sh
+cargo install --path path/to/multifuzz
+```
+
 ## CLI
 
 From your harness crate directory:
 
 ```sh
 # Build all fuzzer binaries (AFL++, honggfuzz, libfuzzer)
-cargo run --manifest-path path/to/multifuzz/Cargo.toml -- build
+multifuzz build
 
 # Run fuzzing with 3 parallel jobs across all engines
-cargo run --manifest-path path/to/multifuzz/Cargo.toml -- fuzz my_target -j 3 -i corpus/ -o output/
+multifuzz fuzz my_target -j 3 -i corpus/ -o output/
 
 # Replay a crash or directory of inputs
-cargo run --manifest-path path/to/multifuzz/Cargo.toml -- run my_target -i output/my_target/crashes/ -r
+multifuzz run my_target -i output/my_target/crashes/ -r
 
 # Add external inputs to a running fuzzing session
-cargo run --manifest-path path/to/multifuzz/Cargo.toml -- add-corpus my_target -i interesting_inputs/ -r
+multifuzz add-corpus my_target -i interesting_inputs/ -r
 ```
 
 ### Options
