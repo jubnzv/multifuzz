@@ -137,6 +137,11 @@ impl Fuzz {
         let (mut processes, engines) = self.spawn_fuzzers()?;
 
         eprintln!("    Crashes: {crash_dir}");
+        if !self.external_corpus.is_empty() {
+            for dir in &self.external_corpus {
+                eprintln!("    External corpus: {}", dir.display());
+            }
+        }
         eprintln!();
         eprint!("    Press Enter to start the dashboard...");
         let _ = std::io::stdin().read_line(&mut String::new());
