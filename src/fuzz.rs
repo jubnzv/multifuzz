@@ -14,6 +14,18 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// Recursively collect all directories under `dir`.
+fn collect_dirs_recursively(dir: &Path, dir_list: &mut HashSet<PathBuf>) {
+    if let Ok(entries) = fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && dir_list.insert(path.clone()) {
+                collect_dirs_recursively(&path, dir_list);
+            }
+        }
+    }
+}
+
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigint(_: libc::c_int) {
@@ -258,6 +270,9 @@ impl Fuzz {
             files.extend(glob(&format!("{}/libfuzzer/corpus/*", self.output_target()))?.flatten());
         }
 
+        // Collect files from external corpus directories
+        let external_files = self.collect_external_corpus_files();
+
         let mut newest_time = last_synced;
         let valid_files: Vec<_> = files
             .iter()
@@ -278,15 +293,27 @@ impl Fuzz {
 
         let max_len = self.max_input_size as u64;
 
-        for file in valid_files {
+        // Merge engine files + external files into the same dedup pipeline
+        let all_files: Vec<&PathBuf> = valid_files
+            .into_iter()
+            .chain(external_files.iter())
+            .collect();
+
+        for file in all_files {
             if file.file_name().is_some() {
-                // Skip inputs that exceed max_input_size — honggfuzz will
-                // abort if it encounters them, and oversized inputs are
-                // unlikely to be useful for the other engines either.
                 let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
                 if file_len > max_len {
                     continue;
                 }
+
+                // Hash-dedup into shared corpus
+                let bytes = fs::read(file).unwrap_or_default();
+                let hash = XxHash64::oneshot(0, &bytes);
+                let corpus_path = format!("{}/corpus/{hash:x}", self.output_target());
+                if Path::new(&corpus_path).exists() {
+                    continue;
+                }
+                let _ = fs::copy(file, &corpus_path);
 
                 // Copy to honggfuzz bridge queue
                 if self.honggfuzz_enabled() {
@@ -299,17 +326,48 @@ impl Fuzz {
                         let _ = fs::copy(file, &queue_path);
                     }
                 }
-                // Hash-dedup into shared corpus
-                let bytes = fs::read(file).unwrap_or_default();
-                let hash = XxHash64::oneshot(0, &bytes);
-                let corpus_path = format!("{}/corpus/{hash:x}", self.output_target());
-                if !Path::new(&corpus_path).exists() {
-                    let _ = fs::copy(file, corpus_path);
-                }
             }
         }
 
         Ok(newest_time)
+    }
+
+    /// Collect files from `--external-corpus` directories.
+    fn collect_external_corpus_files(&self) -> Vec<PathBuf> {
+        if self.external_corpus.is_empty() {
+            return vec![];
+        }
+
+        let mut dirs: Vec<PathBuf> = self.external_corpus.clone();
+
+        if self.external_corpus_recursive {
+            let mut all_dirs = HashSet::new();
+            for dir in &self.external_corpus {
+                all_dirs.insert(dir.clone());
+                collect_dirs_recursively(dir, &mut all_dirs);
+            }
+            for dir in all_dirs {
+                if !dirs.contains(&dir) {
+                    dirs.push(dir);
+                }
+            }
+        }
+
+        dirs.iter()
+            .flat_map(|path| {
+                if path.is_dir() {
+                    fs::read_dir(path)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|e| e.ok())
+                        .map(|e| e.path())
+                        .filter(|p| p.is_file())
+                        .collect::<Vec<_>>()
+                } else {
+                    vec![path.clone()]
+                }
+            })
+            .collect()
     }
 
     // ── spawning ────────────────────────────────────────────────────────
