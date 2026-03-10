@@ -391,35 +391,40 @@ impl Fuzz {
         if afl_jobs > 0 {
             fs::create_dir_all(format!("{}/afl", self.output_target()))?;
             let start = handles.len();
-            self.spawn_afl(&cargo, afl_jobs, &mut handles)?;
+            let afl_cmds = self.spawn_afl(&cargo, afl_jobs, &mut handles)?;
             engines.push(EngineInfo {
                 name: format!("AFL++ ({afl_jobs}P)"),
                 kind: EngineKind::Afl,
                 process_indices: (start..handles.len()).collect(),
             });
             eprintln!("    Launched AFL++ ({afl_jobs} instances)");
+            for cmd in &afl_cmds {
+                eprintln!("      $ {cmd}");
+            }
         }
 
         if honggfuzz_jobs > 0 {
             let start = handles.len();
-            self.spawn_honggfuzz(&cargo, honggfuzz_jobs, &mut handles)?;
+            let hfuzz_cmd = self.spawn_honggfuzz(&cargo, honggfuzz_jobs, &mut handles)?;
             engines.push(EngineInfo {
                 name: format!("honggfuzz ({honggfuzz_jobs}T)"),
                 kind: EngineKind::Honggfuzz,
                 process_indices: (start..handles.len()).collect(),
             });
             eprintln!("    Launched honggfuzz ({honggfuzz_jobs} threads)");
+            eprintln!("      $ {hfuzz_cmd}");
         }
 
         if libfuzzer_jobs > 0 {
             let start = handles.len();
-            self.spawn_libfuzzer(libfuzzer_jobs, &mut handles)?;
+            let lf_cmd = self.spawn_libfuzzer(libfuzzer_jobs, &mut handles)?;
             engines.push(EngineInfo {
                 name: format!("libfuzzer ({libfuzzer_jobs}F)"),
                 kind: EngineKind::Libfuzzer,
                 process_indices: (start..handles.len()).collect(),
             });
             eprintln!("    Launched libfuzzer ({libfuzzer_jobs} workers)");
+            eprintln!("      $ {lf_cmd}");
         }
 
         // Print log paths so the user can tail them in another terminal.
@@ -494,7 +499,7 @@ impl Fuzz {
         cargo: &str,
         afl_jobs: u32,
         handles: &mut Vec<process::Child>,
-    ) -> Result<()> {
+    ) -> Result<Vec<String>> {
         // Power schedule diversity following AFL++ best practices
         let afl_modes = [
             "explore", "fast", "coe", "lin", "quad", "exploit", "rare", "explore", "fast", "mmopt",
@@ -536,6 +541,8 @@ impl Fuzz {
         } else {
             corpus.clone()
         };
+
+        let mut cmds = Vec::new();
 
         for job_num in 0..afl_jobs {
             let is_main = job_num == 0;
@@ -604,27 +611,36 @@ impl Fuzz {
 
             let target_path = format!("./target/afl/debug/{}", self.target);
 
+            let afl_args: Vec<String> = [
+                "afl".to_string(),
+                "fuzz".to_string(),
+                fuzzer_name.clone(),
+                format!("-i{afl_input_dir}"),
+                format!("-p{power_schedule}"),
+                format!("-o{}/afl", self.output_target()),
+                honggfuzz_sync_flag.clone(),
+                libfuzzer_sync_flag.clone(),
+                old_queue.to_string(),
+                cmplog.to_string(),
+                mopt.to_string(),
+                timeout_flag.clone(),
+                max_len_flag.clone(),
+            ]
+            .into_iter()
+            .filter(|a| !a.is_empty())
+            .collect();
+
+            let mut cmd_parts: Vec<String> = Vec::new();
+            cmd_parts.push(format!("AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1 {final_sync}=1"));
+            cmd_parts.push(cargo.to_string());
+            cmd_parts.extend(afl_args.iter().cloned());
+            cmd_parts.extend(dict_flags.iter().cloned());
+            cmd_parts.push(target_path.clone());
+            cmds.push(cmd_parts.join(" "));
+
             handles.push(
                 process::Command::new(cargo)
-                    .args(
-                        [
-                            "afl",
-                            "fuzz",
-                            &fuzzer_name,
-                            &format!("-i{afl_input_dir}"),
-                            &format!("-p{power_schedule}"),
-                            &format!("-o{}/afl", self.output_target()),
-                            &honggfuzz_sync_flag,
-                            &libfuzzer_sync_flag,
-                            old_queue,
-                            cmplog,
-                            mopt,
-                            &timeout_flag,
-                            &max_len_flag,
-                        ]
-                        .iter()
-                        .filter(|a| !a.is_empty()),
-                    )
+                    .args(&afl_args)
                     .args(&dict_flags)
                     .arg(&target_path)
                     .env("AFL_AUTORESUME", "1")
@@ -644,7 +660,7 @@ impl Fuzz {
             );
         }
 
-        Ok(())
+        Ok(cmds)
     }
 
     fn spawn_honggfuzz(
@@ -652,7 +668,7 @@ impl Fuzz {
         cargo: &str,
         honggfuzz_jobs: u32,
         handles: &mut Vec<process::Child>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         let corpus = self.corpus_dir();
 
         let timeout_flag = match self.timeout {
@@ -719,6 +735,28 @@ impl Fuzz {
 
         // The `script` invocation is a trick to get the correct TTY output for
         // honggfuzz (it requires a valid terminal).
+        let hfuzz_run_args = format!(
+            "--input={corpus} \
+             -o{}/honggfuzz/corpus \
+             -n{honggfuzz_jobs} \
+             --dynamic_input={}/queue \
+             -F{} \
+             {timeout_flag} {dict_flag}",
+            self.output_target(),
+            self.output_target(),
+            self.max_input_size,
+        );
+
+        let cmd_str = format!(
+            "HFUZZ_BUILD_ARGS='--features=multifuzz/honggfuzz' \
+             CARGO_TARGET_DIR=./target/honggfuzz \
+             HFUZZ_WORKSPACE={}/honggfuzz \
+             HFUZZ_RUN_ARGS='{hfuzz_run_args}' \
+             {cargo} hfuzz run {}",
+            self.output_target(),
+            self.target,
+        );
+
         let hfuzz_log = File::create(format!("{}/logs/honggfuzz.log", self.output_target()))?;
         let hfuzz_log_clone = hfuzz_log.try_clone()?;
         handles.push(
@@ -736,34 +774,21 @@ impl Fuzz {
                     "HFUZZ_WORKSPACE",
                     format!("{}/honggfuzz", self.output_target()),
                 )
-                .env(
-                    "HFUZZ_RUN_ARGS",
-                    format!(
-                        "--input={corpus} \
-                         -o{}/honggfuzz/corpus \
-                         -n{honggfuzz_jobs} \
-                         --dynamic_input={}/queue \
-                         -F{} \
-                         {timeout_flag} {dict_flag}",
-                        self.output_target(),
-                        self.output_target(),
-                        self.max_input_size,
-                    ),
-                )
+                .env("HFUZZ_RUN_ARGS", &hfuzz_run_args)
                 .stdin(Stdio::null())
                 .stderr(hfuzz_log)
                 .stdout(hfuzz_log_clone)
                 .spawn()?,
         );
 
-        Ok(())
+        Ok(cmd_str)
     }
 
     fn spawn_libfuzzer(
         &self,
         libfuzzer_jobs: u32,
         handles: &mut Vec<process::Child>,
-    ) -> Result<()> {
+    ) -> Result<String> {
         // The libfuzzer binary is built with --target=<triple> to isolate
         // SanitizerCoverage flags from build scripts.
         let host = std::env::consts::ARCH.to_string() + "-unknown-" + std::env::consts::OS + "-gnu";
@@ -798,6 +823,8 @@ impl Fuzz {
             args.push(format!("-dict={}", dict_path.display()));
         }
 
+        let cmd_str = format!("{binary} {}", args.join(" "));
+
         let lf_log = File::create(format!("{}/logs/libfuzzer.log", self.output_target()))?;
         let lf_log_clone = lf_log.try_clone()?;
 
@@ -810,7 +837,7 @@ impl Fuzz {
                 .with_context(|| format!("Failed to spawn libfuzzer binary: {binary}"))?,
         );
 
-        Ok(())
+        Ok(cmd_str)
     }
 }
 
