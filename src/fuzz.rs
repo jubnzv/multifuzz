@@ -9,9 +9,16 @@ use std::{
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{self, Stdio},
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
+
+static STOP: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn handle_sigint(_: libc::c_int) {
+    STOP.store(true, Ordering::Relaxed);
+}
 use twox_hash::XxHash64;
 
 /// Merge multiple dictionary files into one, deduplicating token lines.
@@ -79,6 +86,10 @@ impl Fuzz {
     // ── public entry point ──────────────────────────────────────────────
 
     pub fn fuzz(&mut self) -> Result<()> {
+        // Resolve output to an absolute path so all printed paths are absolute.
+        fs::create_dir_all(&self.output)?;
+        self.output = self.output.canonicalize()?;
+
         // Build first
         let build = Build {
             no_afl: !self.afl_enabled(),
@@ -112,15 +123,30 @@ impl Fuzz {
         }
 
         let (mut processes, engines) = self.spawn_fuzzers()?;
+
+        eprintln!("    Crashes: {crash_dir}");
+        eprintln!();
+        eprint!("    Press Enter to start the dashboard...");
+        let _ = std::io::stdin().read_line(&mut String::new());
+
         let mut dashboard = Dashboard::new(&self.target, &self.output_target(), engines);
         dashboard.record_baseline();
 
         let crash_path = Path::new(&crash_dir);
         let mut last_synced_created_time: Option<SystemTime> = None;
         let mut last_sync_time = Instant::now();
+        let loop_start = Instant::now();
+
+        unsafe {
+            libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t);
+        }
 
         loop {
             thread::sleep(Duration::from_secs(1));
+
+            if STOP.load(Ordering::Relaxed) {
+                break;
+            }
 
             // ── crash collection ────────────────────────────────────────
             self.collect_crashes(crash_path)?;
@@ -136,10 +162,48 @@ impl Fuzz {
 
             // ── dashboard refresh + liveness check ──────────────────────
             if dashboard.refresh(&mut processes) {
-                stop_fuzzers(&mut processes)?;
-                return Ok(());
+                break;
             }
         }
+
+        // ── cleanup + summary ───────────────────────────────────────────
+        self.collect_crashes(crash_path)?;
+        stop_fuzzers(&mut processes)?;
+
+        let elapsed = loop_start.elapsed().as_secs();
+        let days = elapsed / 86400;
+        let hrs = (elapsed % 86400) / 3600;
+        let mins = (elapsed % 3600) / 60;
+        let secs = elapsed % 60;
+        let runtime = if days > 0 {
+            format!("{days} days {hrs:02} hrs {mins:02} mins {secs:02} secs")
+        } else if hrs > 0 {
+            format!("{hrs} hrs {mins:02} mins {secs:02} secs")
+        } else if mins > 0 {
+            format!("{mins} mins {secs:02} secs")
+        } else {
+            format!("{secs} secs")
+        };
+
+        let crash_count = fs::read_dir(crash_path)
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+        let corpus_count = fs::read_dir(format!("{}/corpus", self.output_target()))
+            .map(|entries| entries.flatten().count())
+            .unwrap_or(0);
+
+        eprintln!();
+        eprintln!("── Session complete ──────────────────────────────");
+        eprintln!(" Runtime  : {runtime}");
+        eprintln!(" Crashes  : {crash_count}");
+        eprintln!(" Corpus   : {corpus_count} files");
+        eprintln!();
+        eprintln!(" Results:");
+        eprintln!("   Crashes : {crash_dir}");
+        eprintln!("   Corpus  : {}/corpus/", self.output_target());
+        eprintln!("   Logs    : {}/logs/", self.output_target());
+
+        Ok(())
     }
 
     // ── crash collection ────────────────────────────────────────────────
@@ -293,6 +357,27 @@ impl Fuzz {
                 process_indices: (start..handles.len()).collect(),
             });
             eprintln!("    Launched libfuzzer ({libfuzzer_jobs} workers)");
+        }
+
+        // Print log paths so the user can tail them in another terminal.
+        let logs_dir = format!("{}/logs", self.output_target());
+        eprintln!();
+        eprintln!("    Log files:");
+        if afl_jobs > 0 {
+            for i in 0..afl_jobs {
+                let name = if i == 0 {
+                    "afl.log".to_string()
+                } else {
+                    format!("afl_{i}.log")
+                };
+                eprintln!("      tail -f {logs_dir}/{name}");
+            }
+        }
+        if honggfuzz_jobs > 0 {
+            eprintln!("      tail -f {logs_dir}/honggfuzz.log");
+        }
+        if libfuzzer_jobs > 0 {
+            eprintln!("      tail -f {logs_dir}/libfuzzer.log");
         }
 
         Ok((handles, engines))
