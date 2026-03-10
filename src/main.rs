@@ -1,3 +1,4 @@
+mod add_corpus;
 mod build;
 mod fuzz;
 mod run;
@@ -29,6 +30,8 @@ pub enum Command {
     Fuzz(Fuzz),
     /// Run specific inputs through the runner binary
     Run(Run),
+    /// Add external inputs to a running fuzzing session's corpus
+    AddCorpus(AddCorpus),
 }
 
 #[derive(clap::Args)]
@@ -84,6 +87,34 @@ pub struct Fuzz {
 }
 
 #[derive(clap::Args)]
+pub struct AddCorpus {
+    /// Target binary name
+    #[clap(value_name = "TARGET")]
+    target: String,
+    /// Input files or directories to add
+    #[clap(short = 'i', long = "inputs", value_name = "PATH", num_args = 1..)]
+    inputs: Vec<PathBuf>,
+    /// Recursively traverse input directories
+    #[clap(short, long)]
+    recursive: bool,
+    /// Fuzzers output directory (must match the running session)
+    #[clap(short = 'o', long = "output", value_name = "DIR", default_value = DEFAULT_OUTPUT_DIR)]
+    output: PathBuf,
+    /// Maximum input size in bytes
+    #[clap(long = "max-input-size", value_name = "BYTES", default_value_t = DEFAULT_MAX_INPUT_SIZE)]
+    max_input_size: u32,
+    /// Disable AFL++
+    #[clap(long = "no-afl", action)]
+    no_afl: bool,
+    /// Disable honggfuzz
+    #[clap(long = "no-honggfuzz", action)]
+    no_honggfuzz: bool,
+    /// Disable libfuzzer
+    #[clap(long = "no-libfuzzer", action)]
+    no_libfuzzer: bool,
+}
+
+#[derive(clap::Args)]
 pub struct Run {
     /// Target binary name
     #[clap(value_name = "TARGET")]
@@ -102,5 +133,6 @@ fn main() -> Result<()> {
         Command::Build(args) => args.build().context("Failed to build the fuzzers"),
         Command::Fuzz(mut args) => args.fuzz().context("Failure running fuzzers"),
         Command::Run(args) => args.run().context("Failure running inputs"),
+        Command::AddCorpus(args) => args.add_corpus().context("Failed to add corpus files"),
     }
 }

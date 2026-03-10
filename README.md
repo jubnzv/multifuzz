@@ -48,6 +48,9 @@ cargo run --manifest-path path/to/multifuzz/Cargo.toml -- fuzz my_target -j 3 -i
 
 # Replay a crash or directory of inputs
 cargo run --manifest-path path/to/multifuzz/Cargo.toml -- run my_target -i output/my_target/crashes/ -r
+
+# Add external inputs to a running fuzzing session
+cargo run --manifest-path path/to/multifuzz/Cargo.toml -- add-corpus my_target -i interesting_inputs/ -r
 ```
 
 ### Options
