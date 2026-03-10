@@ -321,11 +321,11 @@ impl Dashboard {
             } else {
                 "\x1b[31mdead\x1b[0m "
             };
-            // exec/s: show "-" if no data yet
-            let exec_s = if es.execs_per_sec > 0.0 {
-                format!("{:.0}", es.execs_per_sec)
-            } else {
+            // exec/s: show "-" when dead or no data yet
+            let exec_s = if !es.alive || es.execs_per_sec <= 0.0 {
                 "-".to_string()
+            } else {
+                format!("{:.0}", es.execs_per_sec)
             };
             let _ = writeln!(
                 buf,
