@@ -280,26 +280,35 @@ impl Fuzz {
             files.extend(glob(&format!("{}/libfuzzer/corpus/*", self.output_target()))?.flatten());
         }
 
-        // Collect files from external corpus directories
-        let external_files = self.collect_external_corpus_files();
+        // Collect files from external corpus directories (time-filtered: only
+        // files modified since the last sync are considered, so we don't re-hash
+        // the entire external dir every cycle).
+        let external_files = self.collect_external_corpus_files(last_synced);
 
         let mut newest_time = last_synced;
-        let valid_files: Vec<_> = files
-            .iter()
-            .filter(|file| {
-                if let Ok(metadata) = file.metadata() {
-                    if let Ok(created) = metadata.created() {
-                        if last_synced.is_none_or(|time| created > time) {
-                            if newest_time.is_none_or(|time| created > time) {
-                                newest_time = Some(created);
-                            }
-                            return true;
+
+        // Time-filter helper: returns true if the file was created after last_synced,
+        // and updates newest_time as a side effect.
+        let mut is_new_file = |file: &PathBuf| -> bool {
+            if let Ok(metadata) = file.metadata() {
+                if let Ok(created) = metadata.created() {
+                    if last_synced.is_none_or(|time| created > time) {
+                        if newest_time.is_none_or(|time| created > time) {
+                            newest_time = Some(created);
                         }
+                        return true;
                     }
                 }
-                false
-            })
-            .collect();
+            }
+            false
+        };
+
+        let valid_files: Vec<_> = files.iter().filter(|f| is_new_file(f)).collect();
+        // External files are already time-filtered by collect_external_corpus_files,
+        // but we still need to update newest_time from them.
+        for f in &external_files {
+            is_new_file(f);
+        }
 
         let max_len = self.max_input_size as u64;
 
@@ -343,7 +352,11 @@ impl Fuzz {
     }
 
     /// Collect files from `--external-corpus` directories.
-    fn collect_external_corpus_files(&self) -> Vec<PathBuf> {
+    ///
+    /// Only files modified after `since` are returned, so we avoid re-scanning
+    /// and re-hashing the entire external directory on every sync cycle.
+    /// On the first sync (`since` is `None`), all files are returned.
+    fn collect_external_corpus_files(&self, since: Option<SystemTime>) -> Vec<PathBuf> {
         if self.external_corpus.is_empty() {
             return vec![];
         }
@@ -376,6 +389,13 @@ impl Fuzz {
                 } else {
                     vec![path.clone()]
                 }
+            })
+            .filter(|p| {
+                since.is_none_or(|t| {
+                    p.metadata()
+                        .and_then(|m| m.modified())
+                        .is_ok_and(|mt| mt > t)
+                })
             })
             .collect()
     }

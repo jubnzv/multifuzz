@@ -81,7 +81,10 @@ pub struct Fuzz {
     /// Corpus sync interval in minutes
     #[clap(long = "sync-interval", value_name = "MINS", default_value_t = 60)]
     sync_interval: u64,
-    /// External corpus directories to import during sync
+    /// External corpus directories to import during each sync cycle.
+    /// Files are hash-deduplicated, size-filtered (--max-input-size), and
+    /// only files modified since the last sync are considered — so adding
+    /// new files to the directory between syncs is cheap.
     #[clap(short = 'e', long = "external-corpus", value_name = "DIR", action = clap::ArgAction::Append)]
     external_corpus: Vec<PathBuf>,
     /// Recursively traverse external corpus directories
