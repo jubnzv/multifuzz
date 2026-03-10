@@ -29,6 +29,8 @@ struct EngineStats {
     alive: bool,
     /// Engine is loading/importing corpus files.
     loading: bool,
+    /// Optional status hint shown instead of "alive" during startup phases.
+    status_hint: Option<String>,
 }
 
 pub struct Dashboard {
@@ -145,13 +147,16 @@ impl Dashboard {
             crashes: 0,
             alive: false,
             loading: false,
+            status_hint: None,
         };
 
         // The engine name encodes the instance dir; for the aggregate view we
         // glob all instances under the afl output dir.
         let pattern = format!("{}/afl/*/fuzzer_stats", self.output_target);
+        let mut found_stats = false;
         for path in glob::glob(&pattern).into_iter().flatten().flatten() {
             if let Ok(contents) = fs::read_to_string(&path) {
+                found_stats = true;
                 for line in contents.lines() {
                     if let Some((key, val)) = line.split_once(':') {
                         let key = key.trim();
@@ -173,9 +178,22 @@ impl Dashboard {
             }
         }
 
-        // If there are multiple AFL instances, this is already the aggregate.
-        // We only have one EngineInfo for all AFL instances, so this is fine.
-        let _ = engine; // used for future per-instance view
+        // No fuzzer_stats yet → AFL++ is still doing dry runs / importing seeds.
+        if !found_stats {
+            let log_path = format!("{}/logs/afl.log", self.output_target);
+            let tail = tail_file(&log_path, 4096);
+            if tail.contains("Attempting dry run") {
+                // Count how many dry runs we've seen
+                let done = tail.matches("Attempting dry run").count();
+                total.status_hint = Some(format!("importing seeds ({done})"));
+                total.loading = true;
+            } else if !tail.is_empty() {
+                total.status_hint = Some("starting".to_string());
+                total.loading = true;
+            }
+        }
+
+        let _ = engine;
         total
     }
 
@@ -188,6 +206,7 @@ impl Dashboard {
             crashes: 0,
             alive: false,
             loading: false,
+            status_hint: None,
         };
 
         let log_path = format!("{}/logs/honggfuzz.log", self.output_target);
@@ -217,9 +236,17 @@ impl Dashboard {
             stats.corpus_count = parse_num(&num) as u64;
         }
 
-        // Detect when honggfuzz is busy loading dynamic input files after a sync.
-        if stats.execs_per_sec == 0.0 && tail.contains("Loading dynamic input file") {
-            stats.loading = true;
+        // Detect startup phases when we have no real stats yet.
+        if stats.execs_per_sec == 0.0 {
+            if tail.contains("Loading dynamic input file") {
+                stats.loading = true;
+            } else if tail.contains("Compiling") && !tail.contains("Speed : ") {
+                stats.status_hint = Some("compiling".to_string());
+                stats.loading = true;
+            } else if !tail.contains("Speed : ") && !tail.is_empty() {
+                stats.status_hint = Some("starting".to_string());
+                stats.loading = true;
+            }
         }
 
         stats
@@ -233,6 +260,7 @@ impl Dashboard {
             crashes: 0,
             alive: false,
             loading: false,
+            status_hint: None,
         };
 
         let log_path = format!("{}/logs/libfuzzer.log", self.output_target);
@@ -307,19 +335,24 @@ impl Dashboard {
             if es.loading && es.alive {
                 let loading_elapsed = self.loading_since.map(|t| t.elapsed()).unwrap_or_default();
                 let ls = loading_elapsed.as_secs();
+                let hint = es.status_hint.as_deref().unwrap_or("syncing corpus");
                 let _ = writeln!(
                     buf,
-                    " {:<20} \x1b[1;33m{spinner} syncing corpus ({:02}:{:02})\x1b[0m",
+                    " {:<20} \x1b[1;33m{spinner} {hint} ({:02}:{:02})\x1b[0m",
                     engine.name,
                     ls / 60,
                     ls % 60,
                 );
                 continue;
             }
-            let status = if es.alive {
-                "\x1b[32malive\x1b[0m"
-            } else {
+            let status = if !es.alive {
                 "\x1b[31mdead\x1b[0m "
+            } else if let Some(ref hint) = es.status_hint {
+                // Alive but with a status hint (e.g. "starting")
+                let _ = writeln!(buf, " {:<20} \x1b[33m{hint}\x1b[0m", engine.name,);
+                continue;
+            } else {
+                "\x1b[32malive\x1b[0m"
             };
             // exec/s: show "-" when dead or no data yet
             let exec_s = if !es.alive || es.execs_per_sec <= 0.0 {
