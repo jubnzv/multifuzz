@@ -146,7 +146,12 @@ impl Fuzz {
         eprint!("    Press Enter to start the dashboard...");
         let _ = std::io::stdin().read_line(&mut String::new());
 
-        let mut dashboard = Dashboard::new(&self.target, &self.output_target(), engines);
+        let mut dashboard = Dashboard::new(
+            &self.target,
+            &self.output_target(),
+            engines,
+            self.sync_interval,
+        );
         dashboard.record_baseline();
 
         let crash_path = Path::new(&crash_dir);
@@ -631,7 +636,9 @@ impl Fuzz {
             .collect();
 
             let mut cmd_parts: Vec<String> = Vec::new();
-            cmd_parts.push(format!("AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1 {final_sync}=1"));
+            cmd_parts.push(format!(
+                "AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1 {final_sync}=1"
+            ));
             cmd_parts.push(cargo.to_string());
             cmd_parts.extend(afl_args.iter().cloned());
             cmd_parts.extend(dict_flags.iter().cloned());

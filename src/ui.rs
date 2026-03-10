@@ -42,6 +42,8 @@ pub struct Dashboard {
     baseline_crashes: Vec<u64>,
     syncing: bool,
     last_sync: Option<String>,
+    /// Sync interval in minutes, for display.
+    sync_interval: u64,
     /// When an engine entered the loading state (for elapsed timer).
     loading_since: Option<Instant>,
 }
@@ -49,7 +51,12 @@ pub struct Dashboard {
 // ── dashboard ────────────────────────────────────────────────────────────
 
 impl Dashboard {
-    pub fn new(target: &str, output_target: &str, engines: Vec<EngineInfo>) -> Self {
+    pub fn new(
+        target: &str,
+        output_target: &str,
+        engines: Vec<EngineInfo>,
+        sync_interval: u64,
+    ) -> Self {
         let baseline_crashes = vec![0; engines.len()];
         Self {
             start_time: Instant::now(),
@@ -59,6 +66,7 @@ impl Dashboard {
             baseline_crashes,
             syncing: false,
             last_sync: None,
+            sync_interval,
             loading_since: None,
         }
     }
@@ -311,7 +319,11 @@ impl Dashboard {
         );
         let _ = writeln!(buf, " Runtime : {}", fmt_duration(elapsed));
         let last_sync_str = self.last_sync.as_deref().unwrap_or("—");
-        let _ = writeln!(buf, " Last sync: {last_sync_str}");
+        let _ = writeln!(
+            buf,
+            " Last sync: {last_sync_str} (every {} min)",
+            self.sync_interval
+        );
         let _ = writeln!(buf, " Corpus  : {} files (shared)", corpus_count);
         let _ = writeln!(buf, " Crashes : {total_crashes}");
         if self.syncing {
