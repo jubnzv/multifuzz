@@ -1,5 +1,5 @@
 use crate::ui::{Dashboard, EngineInfo, EngineKind};
-use crate::{Build, Fuzz};
+use crate::{Build, Fuzz, Strategy};
 use anyhow::{anyhow, Context, Result};
 use glob::glob;
 use std::{
@@ -99,14 +99,20 @@ impl Fuzz {
     // ── public entry point ──────────────────────────────────────────────
 
     pub fn fuzz(&mut self) -> Result<()> {
+        // Validate sequential mode args
+        if matches!(self.strategy, Strategy::Sequential) && self.duration.is_none() {
+            return Err(anyhow!("--duration is required with --strategy sequential"));
+        }
+
         // Resolve output to an absolute path so all printed paths are absolute.
         fs::create_dir_all(&self.output)?;
         self.output = self.output.canonicalize()?;
 
-        // Build first
+        // Build first — for sequential mode, build ALL engines regardless of
+        // honggfuzz_enabled() which checks job count.
         let build = Build {
             no_afl: !self.afl_enabled(),
-            no_honggfuzz: !self.honggfuzz_enabled(),
+            no_honggfuzz: self.no_honggfuzz,
             no_libfuzzer: !self.libfuzzer_enabled(),
         };
         build.build().context("Failed to build the fuzzers")?;
@@ -135,39 +141,10 @@ impl Fuzz {
             self.merged_dict = Some(merge_dicts(&self.dictionaries, &self.output_target())?);
         }
 
-        let (mut processes, engines) = self.spawn_fuzzers()?;
-
-        eprintln!("    Crashes: {crash_dir}");
-        for dir in &self.external_corpus {
-            let count = fs::read_dir(dir)
-                .map(|entries| entries.flatten().filter(|e| e.path().is_file()).count())
-                .unwrap_or(0);
-            if count > 0 {
-                eprintln!(
-                    "    External corpus: {} (contains {count} files — move them to input corpus?)",
-                    dir.display()
-                );
-            } else {
-                eprintln!("    External corpus: {}", dir.display());
-            }
-        }
-        eprintln!();
-        eprintln!("    Fuzzers are running. Press Enter to open the dashboard...");
-
-        let mut dashboard = Dashboard::new(
-            &self.target,
-            &self.output_target(),
-            engines,
-            self.sync_interval,
-        );
-        dashboard.record_baseline();
-
         let crash_path = Path::new(&crash_dir);
-        let mut last_synced_created_time: Option<SystemTime> = None;
-        let mut last_sync_time = Instant::now();
-        let loop_start = Instant::now();
 
         // Wait for Enter in a background thread so fuzzers run immediately.
+        // Shared across all phases in sequential mode.
         let dashboard_ready = std::sync::Arc::new(AtomicBool::new(false));
         {
             let flag = dashboard_ready.clone();
@@ -181,48 +158,92 @@ impl Fuzz {
             libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t);
         }
 
-        loop {
-            thread::sleep(Duration::from_secs(1));
+        let loop_start = Instant::now();
 
-            if STOP.load(Ordering::Relaxed) {
-                break;
+        match self.strategy {
+            Strategy::Parallel => {
+                let (mut processes, engines) = self.spawn_fuzzers()?;
+
+                self.print_launch_info(&crash_dir);
+
+                let mut dashboard = Dashboard::new(
+                    &self.target,
+                    &self.output_target(),
+                    engines,
+                    self.sync_interval,
+                    None,
+                );
+                dashboard.record_baseline();
+
+                self.run_phase(
+                    &mut processes,
+                    &mut dashboard,
+                    crash_path,
+                    None,
+                    &dashboard_ready,
+                )?;
+
+                self.collect_crashes(crash_path)?;
+                stop_fuzzers(&mut processes)?;
             }
-
-            // ── crash collection ────────────────────────────────────────
-            self.collect_crashes(crash_path)?;
-
-            // ── corpus sync (every N minutes) ───────────────────────────
-            if last_sync_time.elapsed().as_secs() > self.sync_interval * 60 {
-                if dashboard_ready.load(Ordering::Relaxed) {
-                    dashboard.set_syncing(true);
-                    dashboard.refresh(&mut processes);
+            Strategy::Sequential => {
+                let duration_mins = self.duration.unwrap();
+                let engine_kinds = self.enabled_engine_kinds();
+                let num_engines = engine_kinds.len();
+                if num_engines == 0 {
+                    return Err(anyhow!("Pick at least one fuzzer"));
                 }
-                last_synced_created_time = self.sync_corpus(last_synced_created_time)?;
-                last_sync_time = Instant::now();
-                if dashboard_ready.load(Ordering::Relaxed) {
-                    dashboard.set_syncing(false);
-                }
-            }
+                let phase_duration_secs = (duration_mins * 60) / num_engines as u64;
 
-            // ── dashboard refresh + liveness check ──────────────────────
-            if !dashboard_ready.load(Ordering::Relaxed) {
-                // Check liveness without drawing
-                let all_dead = processes
-                    .iter_mut()
-                    .all(|p| p.try_wait().unwrap_or(None).is_some());
-                if all_dead {
-                    break;
+                eprintln!(
+                    "    Sequential mode: {num_engines} engine(s), {} min each",
+                    phase_duration_secs / 60
+                );
+                self.print_launch_info(&crash_dir);
+
+                for (phase_idx, kind) in engine_kinds.iter().enumerate() {
+                    if STOP.load(Ordering::Relaxed) {
+                        break;
+                    }
+
+                    let phase_label = format!(
+                        "Phase {}/{}: {}",
+                        phase_idx + 1,
+                        num_engines,
+                        engine_kind_name(*kind)
+                    );
+                    eprintln!();
+                    eprintln!("    ── {phase_label} ──");
+
+                    let (mut processes, engines) = self.spawn_single_engine(*kind, self.jobs)?;
+
+                    let mut dashboard = Dashboard::new(
+                        &self.target,
+                        &self.output_target(),
+                        engines,
+                        self.sync_interval,
+                        Some(phase_label),
+                    );
+                    dashboard.record_baseline();
+
+                    let phase_dur = Duration::from_secs(phase_duration_secs);
+                    let _ = self.run_phase(
+                        &mut processes,
+                        &mut dashboard,
+                        crash_path,
+                        Some(phase_dur),
+                        &dashboard_ready,
+                    )?;
+
+                    self.collect_crashes(crash_path)?;
+                    stop_fuzzers(&mut processes)?;
+
+                    // Force full corpus sync between phases so the next engine
+                    // sees everything from previous phases.
+                    let _ = self.sync_corpus(None)?;
                 }
-                continue;
-            }
-            if dashboard.refresh(&mut processes) {
-                break;
             }
         }
-
-        // ── cleanup + summary ───────────────────────────────────────────
-        self.collect_crashes(crash_path)?;
-        stop_fuzzers(&mut processes)?;
 
         let elapsed = loop_start.elapsed().as_secs();
         let days = elapsed / 86400;
@@ -260,6 +281,157 @@ impl Fuzz {
         Ok(())
     }
 
+    fn print_launch_info(&self, crash_dir: &str) {
+        eprintln!("    Crashes: {crash_dir}");
+        for dir in &self.external_corpus {
+            let count = fs::read_dir(dir)
+                .map(|entries| entries.flatten().filter(|e| e.path().is_file()).count())
+                .unwrap_or(0);
+            if count > 0 {
+                eprintln!(
+                    "    External corpus: {} (contains {count} files — move them to input corpus?)",
+                    dir.display()
+                );
+            } else {
+                eprintln!("    External corpus: {}", dir.display());
+            }
+        }
+        eprintln!();
+        eprintln!("    Fuzzers are running. Press Enter to open the dashboard...");
+    }
+
+    /// Run the main tick loop: crash collection, corpus sync, dashboard refresh,
+    /// liveness check. Returns the last synced creation time.
+    ///
+    /// `phase_duration` of `None` means run forever (parallel mode).
+    fn run_phase(
+        &self,
+        processes: &mut [process::Child],
+        dashboard: &mut Dashboard,
+        crash_path: &Path,
+        phase_duration: Option<Duration>,
+        dashboard_ready: &std::sync::Arc<AtomicBool>,
+    ) -> Result<Option<SystemTime>> {
+        let mut last_synced_created_time: Option<SystemTime> = None;
+        let mut last_sync_time = Instant::now();
+        let phase_start = Instant::now();
+
+        loop {
+            thread::sleep(Duration::from_secs(1));
+
+            if STOP.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Check phase duration timeout
+            if let Some(dur) = phase_duration {
+                if phase_start.elapsed() >= dur {
+                    break;
+                }
+            }
+
+            // ── crash collection ────────────────────────────────────────
+            self.collect_crashes(crash_path)?;
+
+            // ── corpus sync (every N minutes) ───────────────────────────
+            if last_sync_time.elapsed().as_secs() > self.sync_interval * 60 {
+                if dashboard_ready.load(Ordering::Relaxed) {
+                    dashboard.set_syncing(true);
+                    dashboard.refresh(processes);
+                }
+                last_synced_created_time = self.sync_corpus(last_synced_created_time)?;
+                last_sync_time = Instant::now();
+                if dashboard_ready.load(Ordering::Relaxed) {
+                    dashboard.set_syncing(false);
+                }
+            }
+
+            // ── dashboard refresh + liveness check ──────────────────────
+            if !dashboard_ready.load(Ordering::Relaxed) {
+                let all_dead = processes
+                    .iter_mut()
+                    .all(|p| p.try_wait().unwrap_or(None).is_some());
+                if all_dead {
+                    break;
+                }
+                continue;
+            }
+            if dashboard.refresh(processes) {
+                break;
+            }
+        }
+
+        Ok(last_synced_created_time)
+    }
+
+    /// Return the list of enabled engine kinds (respects --no-* flags).
+    /// In sequential mode, honggfuzz is enabled even with 1 job (it gets all jobs).
+    fn enabled_engine_kinds(&self) -> Vec<EngineKind> {
+        let mut kinds = Vec::new();
+        if self.afl_enabled() {
+            kinds.push(EngineKind::Afl);
+        }
+        if !self.no_honggfuzz {
+            kinds.push(EngineKind::Honggfuzz);
+        }
+        if self.libfuzzer_enabled() {
+            kinds.push(EngineKind::Libfuzzer);
+        }
+        kinds
+    }
+
+    /// Spawn a single engine with ALL jobs. Used by sequential mode.
+    fn spawn_single_engine(
+        &self,
+        kind: EngineKind,
+        jobs: u32,
+    ) -> Result<(Vec<process::Child>, Vec<EngineInfo>)> {
+        let mut handles = vec![];
+        let mut engines = vec![];
+        let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
+
+        match kind {
+            EngineKind::Afl => {
+                fs::create_dir_all(format!("{}/afl", self.output_target()))?;
+                let start = handles.len();
+                let afl_cmds = self.spawn_afl(&cargo, jobs, &mut handles)?;
+                engines.push(EngineInfo {
+                    name: format!("AFL++ ({jobs}P)"),
+                    kind: EngineKind::Afl,
+                    process_indices: (start..handles.len()).collect(),
+                });
+                eprintln!("    Launched AFL++ ({jobs} instances)");
+                for cmd in &afl_cmds {
+                    eprintln!("      $ {cmd}");
+                }
+            }
+            EngineKind::Honggfuzz => {
+                let start = handles.len();
+                let hfuzz_cmd = self.spawn_honggfuzz(&cargo, jobs, &mut handles)?;
+                engines.push(EngineInfo {
+                    name: format!("honggfuzz ({jobs}T)"),
+                    kind: EngineKind::Honggfuzz,
+                    process_indices: (start..handles.len()).collect(),
+                });
+                eprintln!("    Launched honggfuzz ({jobs} threads)");
+                eprintln!("      $ {hfuzz_cmd}");
+            }
+            EngineKind::Libfuzzer => {
+                let start = handles.len();
+                let lf_cmd = self.spawn_libfuzzer(jobs, &mut handles)?;
+                engines.push(EngineInfo {
+                    name: format!("libfuzzer ({jobs}F)"),
+                    kind: EngineKind::Libfuzzer,
+                    process_indices: (start..handles.len()).collect(),
+                });
+                eprintln!("    Launched libfuzzer ({jobs} workers)");
+                eprintln!("      $ {lf_cmd}");
+            }
+        }
+
+        Ok((handles, engines))
+    }
+
     // ── crash collection ────────────────────────────────────────────────
 
     fn collect_crashes(&self, crash_path: &Path) -> Result<()> {
@@ -293,8 +465,7 @@ impl Fuzz {
                     let name = entry.file_name();
                     let name_str = name.to_str().unwrap_or_default();
                     if name_str.is_empty()
-                        || ["README.txt", "HONGGFUZZ.REPORT.TXT", "input"]
-                            .contains(&name_str)
+                        || ["README.txt", "HONGGFUZZ.REPORT.TXT", "input"].contains(&name_str)
                     {
                         continue;
                     }
@@ -404,8 +575,7 @@ impl Fuzz {
                 // On the first sync (last_synced is None) we skip this —
                 // honggfuzz already has the initial corpus via --input.
                 if self.honggfuzz_enabled() && last_synced.is_some() {
-                    let queue_path =
-                        format!("{}/queue/{hash:x}", self.output_target());
+                    let queue_path = format!("{}/queue/{hash:x}", self.output_target());
                     let _ = fs::copy(file, &queue_path);
                 }
             }
@@ -931,6 +1101,14 @@ impl Fuzz {
         );
 
         Ok(cmd_str)
+    }
+}
+
+fn engine_kind_name(kind: EngineKind) -> &'static str {
+    match kind {
+        EngineKind::Afl => "AFL++",
+        EngineKind::Honggfuzz => "honggfuzz",
+        EngineKind::Libfuzzer => "libfuzzer",
     }
 }
 

@@ -7,6 +7,13 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
+#[derive(Clone, Copy, Default, clap::ValueEnum)]
+pub enum Strategy {
+    #[default]
+    Parallel,
+    Sequential,
+}
+
 pub const DEFAULT_OUTPUT_DIR: &str = "./output";
 pub const DEFAULT_MAX_INPUT_SIZE: u32 = 8192;
 
@@ -90,6 +97,13 @@ pub struct Fuzz {
     /// Recursively traverse external corpus directories
     #[clap(long = "external-corpus-recursive")]
     external_corpus_recursive: bool,
+    /// Execution strategy: parallel (default) runs all engines at once;
+    /// sequential runs each engine one at a time with all jobs
+    #[clap(long, value_enum, default_value_t = Strategy::Parallel)]
+    strategy: Strategy,
+    /// Total session duration in minutes (required with --strategy sequential)
+    #[clap(long = "duration", value_name = "MINS")]
+    duration: Option<u64>,
 }
 
 #[derive(clap::Args)]

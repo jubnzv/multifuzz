@@ -46,6 +46,8 @@ pub struct Dashboard {
     sync_interval: u64,
     /// When an engine entered the loading state (for elapsed timer).
     loading_since: Option<Instant>,
+    /// Optional label shown in header for sequential mode (e.g. "Phase 2/3: honggfuzz").
+    phase_label: Option<String>,
 }
 
 // ── dashboard ────────────────────────────────────────────────────────────
@@ -56,6 +58,7 @@ impl Dashboard {
         output_target: &str,
         engines: Vec<EngineInfo>,
         sync_interval: u64,
+        phase_label: Option<String>,
     ) -> Self {
         let baseline_crashes = vec![0; engines.len()];
         Self {
@@ -68,6 +71,7 @@ impl Dashboard {
             last_sync: None,
             sync_interval,
             loading_since: None,
+            phase_label,
         }
     }
 
@@ -311,7 +315,11 @@ impl Dashboard {
         // Clear screen + move cursor home.
         let _ = write!(buf, "\x1b[2J\x1b[H");
 
-        let header = format!("── multifuzz ── {} ", self.target);
+        let header = if let Some(ref label) = self.phase_label {
+            format!("── multifuzz ── {} ({}) ", self.target, label)
+        } else {
+            format!("── multifuzz ── {} ", self.target)
+        };
         let _ = writeln!(
             buf,
             "\x1b[1m{header}{}\x1b[0m",
