@@ -151,8 +151,7 @@ impl Fuzz {
             }
         }
         eprintln!();
-        eprint!("    Press Enter to start the dashboard...");
-        let _ = std::io::stdin().read_line(&mut String::new());
+        eprintln!("    Fuzzers are running. Press Enter to open the dashboard...");
 
         let mut dashboard = Dashboard::new(
             &self.target,
@@ -166,6 +165,16 @@ impl Fuzz {
         let mut last_synced_created_time: Option<SystemTime> = None;
         let mut last_sync_time = Instant::now();
         let loop_start = Instant::now();
+
+        // Wait for Enter in a background thread so fuzzers run immediately.
+        let dashboard_ready = std::sync::Arc::new(AtomicBool::new(false));
+        {
+            let flag = dashboard_ready.clone();
+            thread::spawn(move || {
+                let _ = std::io::stdin().read_line(&mut String::new());
+                flag.store(true, Ordering::Relaxed);
+            });
+        }
 
         unsafe {
             libc::signal(libc::SIGINT, handle_sigint as libc::sighandler_t);
@@ -181,16 +190,30 @@ impl Fuzz {
             // ── crash collection ────────────────────────────────────────
             self.collect_crashes(crash_path)?;
 
-            // ── corpus sync (every 10 minutes) ─────────────────────────
+            // ── corpus sync (every N minutes) ───────────────────────────
             if last_sync_time.elapsed().as_secs() > self.sync_interval * 60 {
-                dashboard.set_syncing(true);
-                dashboard.refresh(&mut processes);
+                if dashboard_ready.load(Ordering::Relaxed) {
+                    dashboard.set_syncing(true);
+                    dashboard.refresh(&mut processes);
+                }
                 last_synced_created_time = self.sync_corpus(last_synced_created_time)?;
                 last_sync_time = Instant::now();
-                dashboard.set_syncing(false);
+                if dashboard_ready.load(Ordering::Relaxed) {
+                    dashboard.set_syncing(false);
+                }
             }
 
             // ── dashboard refresh + liveness check ──────────────────────
+            if !dashboard_ready.load(Ordering::Relaxed) {
+                // Check liveness without drawing
+                let all_dead = processes
+                    .iter_mut()
+                    .all(|p| p.try_wait().unwrap_or(None).is_some());
+                if all_dead {
+                    break;
+                }
+                continue;
+            }
             if dashboard.refresh(&mut processes) {
                 break;
             }
