@@ -137,8 +137,16 @@ impl Fuzz {
         let (mut processes, engines) = self.spawn_fuzzers()?;
 
         eprintln!("    Crashes: {crash_dir}");
-        if !self.external_corpus.is_empty() {
-            for dir in &self.external_corpus {
+        for dir in &self.external_corpus {
+            let count = fs::read_dir(dir)
+                .map(|entries| entries.flatten().filter(|e| e.path().is_file()).count())
+                .unwrap_or(0);
+            if count > 0 {
+                eprintln!(
+                    "    External corpus: {} (contains {count} files — move them to input corpus?)",
+                    dir.display()
+                );
+            } else {
                 eprintln!("    External corpus: {}", dir.display());
             }
         }
@@ -231,26 +239,58 @@ impl Fuzz {
     // ── crash collection ────────────────────────────────────────────────
 
     fn collect_crashes(&self, crash_path: &Path) -> Result<()> {
-        let mut extra_dirs: Vec<std::path::PathBuf> =
-            vec![format!("{}/honggfuzz/{}", self.output_target(), self.target).into()];
-        if self.libfuzzer_enabled() {
-            extra_dirs.push(format!("{}/libfuzzer/crashes", self.output_target()).into());
-        }
-
-        let crash_dirs = glob(&format!("{}/afl/*/crashes", self.output_target()))
+        let afl_pattern = format!("{}/afl/*/crashes", self.output_target());
+        let afl_dirs: Vec<_> = glob(&afl_pattern)
             .map_err(|_| anyhow!("Failed to read crashes glob pattern"))?
             .flatten()
-            .chain(extra_dirs);
+            .map(|d| ("afl", d))
+            .collect();
 
-        for dir in crash_dirs {
+        let mut dirs: Vec<(&str, PathBuf)> = afl_dirs;
+        dirs.push((
+            "honggfuzz",
+            format!("{}/honggfuzz/{}", self.output_target(), self.target).into(),
+        ));
+        if self.libfuzzer_enabled() {
+            dirs.push((
+                "libfuzzer",
+                format!("{}/libfuzzer/crashes", self.output_target()).into(),
+            ));
+        }
+
+        let ts = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+
+        for (engine, dir) in dirs {
             if let Ok(entries) = fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let name = entry.file_name();
-                    let dest = crash_path.join(&name);
-                    if dest.exists()
-                        || ["", "README.txt", "HONGGFUZZ.REPORT.TXT", "input"]
-                            .contains(&name.to_str().unwrap_or_default())
+                    let name_str = name.to_str().unwrap_or_default();
+                    if name_str.is_empty()
+                        || ["README.txt", "HONGGFUZZ.REPORT.TXT", "input"]
+                            .contains(&name_str)
                     {
+                        continue;
+                    }
+                    let dest_name = format!("{engine}_{ts}_{name_str}");
+                    let dest = crash_path.join(&dest_name);
+                    if dest.exists() {
+                        continue;
+                    }
+                    // Also skip if we already collected this crash under a
+                    // different timestamp (same engine + original name).
+                    let already_collected = fs::read_dir(crash_path)
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .any(|e| {
+                            let n = e.file_name();
+                            let s = n.to_str().unwrap_or_default();
+                            s.starts_with(&format!("{engine}_")) && s.ends_with(name_str)
+                        });
+                    if already_collected {
                         continue;
                     }
                     fs::copy(entry.path(), dest)?;
@@ -334,16 +374,15 @@ impl Fuzz {
                 }
                 let _ = fs::copy(file, &corpus_path);
 
-                // Copy to honggfuzz bridge queue
-                if self.honggfuzz_enabled() {
-                    let queue_path = format!(
-                        "{}/queue/{:?}",
-                        self.output_target(),
-                        file.file_name().unwrap()
-                    );
-                    if !Path::new(&queue_path).exists() {
-                        let _ = fs::copy(file, &queue_path);
-                    }
+                // Copy to honggfuzz bridge queue (--dynamic_input dir).
+                // Honggfuzz unlinks files after ingesting them (~1s poll),
+                // so we only feed genuinely new files from subsequent syncs.
+                // On the first sync (last_synced is None) we skip this —
+                // honggfuzz already has the initial corpus via --input.
+                if self.honggfuzz_enabled() && last_synced.is_some() {
+                    let queue_path =
+                        format!("{}/queue/{hash:x}", self.output_target());
+                    let _ = fs::copy(file, &queue_path);
                 }
             }
         }
