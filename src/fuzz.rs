@@ -31,6 +31,7 @@ static STOP: AtomicBool = AtomicBool::new(false);
 extern "C" fn handle_sigint(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
+use std::os::unix::process::CommandExt;
 use twox_hash::XxHash64;
 
 /// Merge multiple dictionary files into one, deduplicating token lines.
@@ -745,6 +746,7 @@ impl Fuzz {
                     .env("AFL_IGNORE_SEED_PROBLEMS", "1")
                     .stdout(log_destination())
                     .stderr(log_destination())
+                    .process_group(0)
                     .spawn()?,
             );
         }
@@ -867,6 +869,7 @@ impl Fuzz {
                 .stdin(Stdio::null())
                 .stderr(hfuzz_log)
                 .stdout(hfuzz_log_clone)
+                .process_group(0)
                 .spawn()?,
         );
 
@@ -922,6 +925,7 @@ impl Fuzz {
                 .args(&args)
                 .stdout(lf_log)
                 .stderr(lf_log_clone)
+                .process_group(0)
                 .spawn()
                 .with_context(|| format!("Failed to spawn libfuzzer binary: {binary}"))?,
         );
@@ -931,6 +935,27 @@ impl Fuzz {
 }
 
 // ── process management ──────────────────────────────────────────────────
+
+/// Kill a process and all its descendants.
+///
+/// First tries SIGTERM to the process group (negative PID), which catches
+/// libfuzzer fork-mode workers spawned via `system()`. Falls back to
+/// recursive pgrep-based tree walk for processes that escaped the group.
+fn kill_process_tree(pid: u32) -> Result<()> {
+    let pid_i32 = pid as i32;
+
+    // SIGTERM the entire process group rooted at this PID.
+    // Negative PID → signal the process group whose PGID equals |pid|.
+    unsafe {
+        libc::kill(-pid_i32, libc::SIGTERM);
+    }
+
+    // Also walk the tree via pgrep in case any children have a different PGID
+    // (e.g. `script` wrapper creates a new session).
+    kill_subprocesses_recursively(&pid.to_string())?;
+
+    Ok(())
+}
 
 /// Recursively send SIGTERM to a process tree rooted at `pid`.
 fn kill_subprocesses_recursively(pid: &str) -> Result<()> {
@@ -952,7 +977,7 @@ fn kill_subprocesses_recursively(pid: &str) -> Result<()> {
 
 fn stop_fuzzers(processes: &mut Vec<process::Child>) -> Result<()> {
     for process in processes {
-        kill_subprocesses_recursively(&process.id().to_string())?;
+        kill_process_tree(process.id())?;
     }
     Ok(())
 }
