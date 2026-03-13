@@ -1055,8 +1055,16 @@ impl Fuzz {
         // Apply per-worker AFL env rules from TOML config.
         config::apply_afl_env_rules(&mut cmd, job_num, &self.afl_env_rules);
 
+        let mut env_prefix =
+            String::from("AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1");
+        for rule in &self.afl_env_rules {
+            if rule.selector.matches(job_num) {
+                env_prefix.push_str(&format!(" {}={}", rule.key, rule.value));
+            }
+        }
         let cmd_str = format!(
-            "AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1 {} {} {}",
+            "{} {} {} {}",
+            env_prefix,
             cargo,
             afl_args.join(" "),
             target_path,
@@ -1126,16 +1134,22 @@ impl Fuzz {
             .filter(|a| !a.is_empty())
             .collect();
 
-            let mut cmd_parts: Vec<String> = Vec::new();
-            cmd_parts.push(
-                "AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1 AFL_FINAL_SYNC=1"
-                    .to_string(),
+            let mut env_prefix = String::from(
+                "AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1 AFL_FINAL_SYNC=1",
             );
+            for rule in &self.afl_env_rules {
+                if rule.selector.matches(job_num) {
+                    env_prefix.push_str(&format!(" {}={}", rule.key, rule.value));
+                }
+            }
+            let mut cmd_parts: Vec<String> = Vec::new();
+            cmd_parts.push(env_prefix);
             cmd_parts.push(cargo.to_string());
             cmd_parts.extend(afl_args.iter().cloned());
             cmd_parts.extend(dict_flags.iter().cloned());
             cmd_parts.push(target_path.clone());
-            cmds.push(cmd_parts.join(" "));
+            let main_cmd_str = cmd_parts.join(" ");
+            cmds.push(main_cmd_str.clone());
 
             let mut cmd = process::Command::new(cargo);
             cmd.args(&afl_args)
@@ -1157,7 +1171,6 @@ impl Fuzz {
                 .process_group(0);
             config::apply_afl_env_rules(&mut cmd, job_num, &self.afl_env_rules);
 
-            let main_cmd_str = cmd_parts.join(" ");
             handles.push(Some(ProcessSlot {
                 child: cmd.spawn()?,
                 paused: false,
@@ -1169,51 +1182,7 @@ impl Fuzz {
         // Spawn secondaries (job_num 1..afl_jobs)
         for job_num in 1..afl_jobs {
             let (child, sec_cmd_str) = self.spawn_afl_secondary(cargo, job_num)?;
-
-            // Build command string for logging
-            let fuzzer_name = format!("-Ssecondaryfuzzer{job_num}");
-            let power_schedule = afl_modes
-                .get(job_num as usize % afl_modes.len())
-                .unwrap_or(&"fast");
-            let timeout_flag = match self.timeout {
-                Some(t) => format!("-t{}", t * 1000),
-                None => String::new(),
-            };
-            let max_len_flag = format!("-G{}", self.max_input_size());
-            let mopt = if job_num % 10 == 9 { "-L0" } else { "" };
-            let old_queue = if job_num % 10 == 8 { "-Z" } else { "" };
-            let target_path = format!("./target/afl/debug/{}", self.target());
-            let target_path_str = format!("./target/afl/debug/{}", self.target());
-            let cmplog_flags: Vec<String> = match job_num {
-                1 => vec![format!("-c{target_path_str}"), "-l2a".to_string()],
-                3 => vec![format!("-c{target_path_str}"), "-l1".to_string()],
-                14 => vec![format!("-c{target_path_str}"), "-l2a".to_string()],
-                22 => vec![format!("-c{target_path_str}"), "-l3at".to_string()],
-                _ => vec![],
-            };
-
-            let mut cmd_parts: Vec<String> = Vec::new();
-            cmd_parts.push("AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1".to_string());
-            cmd_parts.push(cargo.to_string());
-            cmd_parts.push("afl fuzz".to_string());
-            cmd_parts.push(fuzzer_name);
-            cmd_parts.push(format!("-i{afl_input_dir}"));
-            cmd_parts.push(format!("-p{power_schedule}"));
-            cmd_parts.push(format!("-o{}/afl", self.output_target()));
-            if !old_queue.is_empty() {
-                cmd_parts.push(old_queue.to_string());
-            }
-            if !mopt.is_empty() {
-                cmd_parts.push(mopt.to_string());
-            }
-            if !timeout_flag.is_empty() {
-                cmd_parts.push(timeout_flag);
-            }
-            cmd_parts.push(max_len_flag);
-            cmd_parts.extend(cmplog_flags);
-            cmd_parts.extend(dict_flags.iter().cloned());
-            cmd_parts.push(target_path);
-            cmds.push(cmd_parts.join(" "));
+            cmds.push(sec_cmd_str.clone());
 
             handles.push(Some(ProcessSlot {
                 child,
