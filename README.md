@@ -41,16 +41,41 @@ cargo install honggfuzz
 cargo install --path path/to/multifuzz
 ```
 
-## CLI
+## Configuration
 
-From your harness crate directory:
+Campaigns are configured via a TOML file (`multifuzz.toml` by default, or `--config <path>`). See `multifuzz.toml.example` for a full reference.
+
+```toml
+[fuzz]
+target = "my_target"
+jobs = 4
+corpus = "./corpus"
+output = "./output"
+timeout = 10
+strategy = "parallel"       # "parallel", "afl-only", "hongg-only", "libfuzzer-only"
+sync_interval = 60
+dictionaries = ["./dict.dict"]
+
+[fuzz.web]
+enabled = true
+
+# Per-worker AFL++ env overrides.
+# Keys: "all", "even", "odd", "workerN".
+[fuzz.afl.all.env]
+AFL_SKIP_CPUFREQ = "1"
+
+[fuzz.afl.worker2.env]
+AFL_CUSTOM_MUTATOR_LIBRARY = "/path/to/mutator.so"
+```
+
+## CLI
 
 ```sh
 # Build all fuzzer binaries (AFL++, honggfuzz, libfuzzer)
 multifuzz build
 
-# Run fuzzing with 3 parallel jobs across all engines
-multifuzz fuzz my_target -j 3 -i corpus/ -o output/
+# Run campaign (reads multifuzz.toml from cwd, or pass --config <path>)
+multifuzz fuzz
 
 # Replay a crash or directory of inputs
 multifuzz run my_target -i output/my_target/crashes/ -r
@@ -59,24 +84,13 @@ multifuzz run my_target -i output/my_target/crashes/ -r
 multifuzz add-corpus my_target -i interesting_inputs/ -r
 ```
 
-### Options
+## Web dashboard
 
-| Flag | Description |
-|---|---|
-| `-j NUM` | Number of concurrent jobs (default: 1) |
-| `-i DIR` | Corpus directory |
-| `-o DIR` | Output directory (default: `./output`) |
-| `-x FILE` | Dictionary file (repeatable) |
-| `-t SECS` | Timeout per run |
-| `--no-afl` | Disable AFL++ |
-| `--no-honggfuzz` | Disable honggfuzz |
-| `--no-libfuzzer` | Disable libfuzzer |
-| `--max-input-size BYTES` | Maximum input size in bytes (default: 8192) |
-| `--sync-interval MINS` | Corpus sync interval in minutes (default: 60) |
+An optional lightweight web UI (`[fuzz.web] enabled = true`) provides real-time monitoring, pause/resume controls, and worker scaling for running campaigns.
 
 ## How it works
 
-Jobs are distributed across engines automatically. Corpus files are synchronized between engines periodically (default: every 60 minutes, configurable via `--sync-interval`) using hash-based deduplication. Crashes from all engines are collected into a unified `crashes/` directory.
+Jobs are distributed across engines automatically. Corpus files are synchronized between engines periodically using hash-based deduplication. Crashes from all engines are collected into a unified `crashes/` directory.
 
 ## License
 
