@@ -1,7 +1,9 @@
+use crate::Strategy;
 use std::{
+    collections::{HashMap, VecDeque},
     fmt::Write as FmtWrite,
     fs,
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom},
     process,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -15,11 +17,30 @@ pub enum EngineKind {
     Libfuzzer,
 }
 
+pub struct ProcessSlot {
+    pub child: process::Child,
+    pub paused: bool,
+    /// AFL job_num (for display label), None for honggfuzz/libfuzzer.
+    pub job_num: Option<u32>,
+}
+
 pub struct EngineInfo {
     pub name: String,
     pub kind: EngineKind,
     /// Indices into the process handles vec that belong to this engine group.
     pub process_indices: Vec<usize>,
+    /// Number of workers: AFL processes, honggfuzz threads, libfuzzer forks.
+    pub worker_count: u32,
+}
+
+pub struct EngineStatsSnapshot {
+    pub name: String,
+    pub alive: bool,
+    pub loading: bool,
+    pub status_hint: Option<String>,
+    pub execs_per_sec: f64,
+    pub corpus_count: u64,
+    pub crashes: u64,
 }
 
 struct EngineStats {
@@ -33,34 +54,92 @@ struct EngineStats {
     status_hint: Option<String>,
 }
 
+const GRAPH_MAX_SAMPLES: usize = 1800; // 30 min at 1 sample/sec
+
+struct TimeSeriesSample {
+    elapsed_secs: f64,
+    per_engine: Vec<f64>,
+}
+
+struct ScalarSample {
+    elapsed_secs: f64,
+    value: f64,
+}
+
+struct SyncPeriod {
+    start_secs: f64,
+    end_secs: Option<f64>,
+}
+
 pub struct Dashboard {
     start_time: Instant,
     target: String,
     output_target: String,
-    engines: Vec<EngineInfo>,
+    pub engines: Vec<EngineInfo>,
     /// Crash counts at startup, subtracted from displayed values.
     baseline_crashes: Vec<u64>,
     syncing: bool,
     last_sync: Option<String>,
     /// Sync interval in minutes, for display.
     sync_interval: u64,
-    /// When an engine entered the loading state (for elapsed timer).
-    loading_since: Option<Instant>,
-    /// Optional label shown in header for sequential mode (e.g. "Phase 2/3: honggfuzz").
-    phase_label: Option<String>,
+    /// Show strategy switching controls in web UI.
+    show_switch_hints: bool,
+    /// Current strategy, for selecting the default in the dropdown.
+    current_strategy: Option<Strategy>,
+    /// Number of AFL instances, for listing individual log files.
+    pub afl_job_count: u32,
+    /// Path to the shared corpus directory.
+    corpus_dir: String,
+    /// External corpus directories (display only).
+    external_corpus: Vec<String>,
+    /// Path to the crashes directory.
+    crash_dir: String,
+
+    // Time-series ring buffers
+    exec_history: VecDeque<TimeSeriesSample>,
+    corpus_history: VecDeque<ScalarSample>,
+    cpu_history: VecDeque<TimeSeriesSample>,
+    mem_history: VecDeque<TimeSeriesSample>,
+
+    /// CPU jiffies at previous tick, keyed by PID.
+    prev_cpu_jiffies: HashMap<u32, u64>,
+    /// Elapsed seconds at previous tick (for accurate CPU% delta).
+    prev_tick_secs: f64,
+
+    /// Labels for graph lines (rebuilt each tick to track AFL workers individually).
+    graph_labels: Vec<String>,
+    /// Colors matching graph_labels.
+    graph_colors: Vec<String>,
+
+    /// Per-AFL-worker baseline crash counts (keyed by job_num).
+    baseline_worker_crashes: HashMap<u32, u64>,
+
+    clock_ticks_per_sec: f64,
+    page_size: usize,
+
+    /// Sync period annotations rendered as shaded bands on graphs.
+    sync_periods: Vec<SyncPeriod>,
 }
 
 // ── dashboard ────────────────────────────────────────────────────────────
 
 impl Dashboard {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         target: &str,
         output_target: &str,
         engines: Vec<EngineInfo>,
         sync_interval: u64,
-        phase_label: Option<String>,
+        show_switch_hints: bool,
+        current_strategy: Option<Strategy>,
+        afl_job_count: u32,
+        corpus_dir: &str,
+        external_corpus: Vec<String>,
+        crash_dir: &str,
     ) -> Self {
         let baseline_crashes = vec![0; engines.len()];
+        let clock_ticks_per_sec = unsafe { libc::sysconf(libc::_SC_CLK_TCK) as f64 };
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as usize };
         Self {
             start_time: Instant::now(),
             target: target.to_string(),
@@ -70,15 +149,41 @@ impl Dashboard {
             syncing: false,
             last_sync: None,
             sync_interval,
-            loading_since: None,
-            phase_label,
+            show_switch_hints,
+            current_strategy,
+            afl_job_count,
+            corpus_dir: corpus_dir.to_string(),
+            external_corpus,
+            crash_dir: crash_dir.to_string(),
+            exec_history: VecDeque::with_capacity(GRAPH_MAX_SAMPLES),
+            corpus_history: VecDeque::with_capacity(GRAPH_MAX_SAMPLES),
+            cpu_history: VecDeque::with_capacity(GRAPH_MAX_SAMPLES),
+            mem_history: VecDeque::with_capacity(GRAPH_MAX_SAMPLES),
+            prev_cpu_jiffies: HashMap::new(),
+            prev_tick_secs: 0.0,
+            graph_labels: Vec::new(),
+            graph_colors: Vec::new(),
+            baseline_worker_crashes: HashMap::new(),
+            clock_ticks_per_sec,
+            page_size,
+            sync_periods: Vec::new(),
         }
     }
 
     /// Snapshot current crash counts as the baseline so the dashboard only
     /// shows crashes from this session.
     pub fn set_syncing(&mut self, syncing: bool) {
+        if syncing && !self.syncing {
+            let elapsed = self.start_time.elapsed().as_secs_f64();
+            self.sync_periods.push(SyncPeriod {
+                start_secs: elapsed,
+                end_secs: None,
+            });
+        }
         if !syncing && self.syncing {
+            if let Some(last) = self.sync_periods.last_mut() {
+                last.end_secs = Some(self.start_time.elapsed().as_secs_f64());
+            }
             let secs = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
@@ -94,7 +199,13 @@ impl Dashboard {
     pub fn record_baseline(&mut self) {
         for (i, engine) in self.engines.iter().enumerate() {
             let es = match engine.kind {
-                EngineKind::Afl => self.read_afl_stats(engine),
+                EngineKind::Afl => {
+                    let (total, per_worker) = self.read_afl_all_stats();
+                    for (jn, ws) in &per_worker {
+                        self.baseline_worker_crashes.insert(*jn, ws.crashes);
+                    }
+                    total
+                }
                 EngineKind::Honggfuzz => self.read_honggfuzz_stats(),
                 EngineKind::Libfuzzer => self.read_libfuzzer_stats(),
             };
@@ -102,18 +213,189 @@ impl Dashboard {
         }
     }
 
-    /// Read stats, redraw the dashboard. Returns `true` when every process has
-    /// exited (i.e. the caller should stop the loop).
-    pub fn refresh(&mut self, processes: &mut [process::Child]) -> bool {
+    /// Record one tick of time-series data for graphs.
+    /// AFL++ workers are expanded into individual graph lines.
+    pub fn record_tick(
+        &mut self,
+        _stats: &[EngineStatsSnapshot],
+        corpus_count: u64,
+        processes: &[Option<ProcessSlot>],
+    ) {
+        let elapsed_secs = self.start_time.elapsed().as_secs_f64();
+        let dt = elapsed_secs - self.prev_tick_secs;
+        let first_tick = self.prev_tick_secs == 0.0;
+        self.prev_tick_secs = elapsed_secs;
+
+        // Build per-graph-line values: expand AFL workers individually.
+        let mut exec_values = Vec::new();
+        let mut cpu_values = Vec::new();
+        let mut mem_values = Vec::new();
+        let mut labels = Vec::new();
+        let mut colors = Vec::new();
+
+        // AFL per-worker exec/s from fuzzer_stats
+        let afl_worker_stats: HashMap<u32, EngineStats> = {
+            let has_afl = self
+                .engines
+                .iter()
+                .any(|e| matches!(e.kind, EngineKind::Afl));
+            if has_afl {
+                self.read_afl_all_stats().1
+            } else {
+                HashMap::new()
+            }
+        };
+
+        // AFL worker color palette (cycle through shades of red/orange)
+        const AFL_COLORS: &[&str] = &[
+            "#ff6b6b", "#ff8e8e", "#ff4444", "#e05555", "#ff9955", "#ffb366", "#cc5544", "#ff7755",
+            "#dd6666", "#ee8844",
+        ];
+
+        for engine in &self.engines {
+            match engine.kind {
+                EngineKind::Afl => {
+                    // One graph line per AFL worker process
+                    for (wi, &idx) in engine.process_indices.iter().enumerate() {
+                        let ps = processes.get(idx).and_then(|o| o.as_ref());
+                        let job_num = ps.and_then(|p| p.job_num);
+                        let label = if let Some(jn) = job_num {
+                            if jn == 0 {
+                                "AFL++ main".to_string()
+                            } else {
+                                format!("AFL++ #{jn}")
+                            }
+                        } else {
+                            format!("AFL++ w{wi}")
+                        };
+
+                        // Exec/s from fuzzer_stats
+                        let exec_s = job_num
+                            .and_then(|jn| afl_worker_stats.get(&jn))
+                            .map(|ws| ws.execs_per_sec)
+                            .unwrap_or(0.0);
+                        exec_values.push(exec_s);
+
+                        // CPU & memory from /proc
+                        if let Some(ps) = ps {
+                            let pid = ps.child.id();
+                            let jiffies = read_proc_cpu_jiffies(pid);
+                            let rss = read_proc_rss_bytes(pid, self.page_size);
+
+                            let cpu_pct = if first_tick || dt <= 0.0 {
+                                0.0
+                            } else {
+                                let prev =
+                                    self.prev_cpu_jiffies.get(&pid).copied().unwrap_or(jiffies);
+                                let delta = jiffies.saturating_sub(prev);
+                                delta as f64 / self.clock_ticks_per_sec / dt * 100.0
+                            };
+                            self.prev_cpu_jiffies.insert(pid, jiffies);
+                            cpu_values.push(cpu_pct);
+                            mem_values.push(rss as f64 / (1024.0 * 1024.0));
+                        } else {
+                            cpu_values.push(0.0);
+                            mem_values.push(0.0);
+                        }
+
+                        labels.push(label);
+                        colors.push(AFL_COLORS[wi % AFL_COLORS.len()].to_string());
+                    }
+                }
+                _ => {
+                    // Non-AFL: one graph line per engine, aggregate all processes
+                    let mut total_jiffies: u64 = 0;
+                    let mut total_rss: u64 = 0;
+                    // Use a synthetic PID key for the engine aggregate (won't collide with real PIDs)
+                    let synth_key = u32::MAX - labels.len() as u32;
+                    for &idx in &engine.process_indices {
+                        if let Some(ps) = processes.get(idx).and_then(|o| o.as_ref()) {
+                            let pid = ps.child.id();
+                            total_jiffies += read_proc_cpu_jiffies(pid);
+                            total_rss += read_proc_rss_bytes(pid, self.page_size);
+                        }
+                    }
+                    let cpu_pct = if first_tick || dt <= 0.0 {
+                        0.0
+                    } else {
+                        let prev = self
+                            .prev_cpu_jiffies
+                            .get(&synth_key)
+                            .copied()
+                            .unwrap_or(total_jiffies);
+                        let delta = total_jiffies.saturating_sub(prev);
+                        delta as f64 / self.clock_ticks_per_sec / dt * 100.0
+                    };
+                    self.prev_cpu_jiffies.insert(synth_key, total_jiffies);
+
+                    exec_values.push(match engine.kind {
+                        EngineKind::Honggfuzz => self.read_honggfuzz_stats().execs_per_sec,
+                        EngineKind::Libfuzzer => self.read_libfuzzer_stats().execs_per_sec,
+                        _ => 0.0,
+                    });
+                    cpu_values.push(cpu_pct);
+                    mem_values.push(total_rss as f64 / (1024.0 * 1024.0));
+
+                    labels.push(engine.name.clone());
+                    colors.push(match engine.kind {
+                        EngineKind::Honggfuzz => "#ffd93d".to_string(),
+                        EngineKind::Libfuzzer => "#6bcb77".to_string(),
+                        _ => "#ffffff".to_string(),
+                    });
+                }
+            }
+        }
+
+        self.graph_labels = labels;
+        self.graph_colors = colors;
+
+        self.exec_history.push_back(TimeSeriesSample {
+            elapsed_secs,
+            per_engine: exec_values,
+        });
+        self.corpus_history.push_back(ScalarSample {
+            elapsed_secs,
+            value: corpus_count as f64,
+        });
+        self.cpu_history.push_back(TimeSeriesSample {
+            elapsed_secs,
+            per_engine: cpu_values,
+        });
+        self.mem_history.push_back(TimeSeriesSample {
+            elapsed_secs,
+            per_engine: mem_values,
+        });
+
+        // Evict old samples
+        for buf in [
+            &mut self.exec_history,
+            &mut self.cpu_history,
+            &mut self.mem_history,
+        ] {
+            while buf.len() > GRAPH_MAX_SAMPLES {
+                buf.pop_front();
+            }
+        }
+        while self.corpus_history.len() > GRAPH_MAX_SAMPLES {
+            self.corpus_history.pop_front();
+        }
+    }
+
+    /// Collect stats from all engines. Returns (per-engine snapshots, corpus count, all_dead).
+    pub fn collect_stats(
+        &self,
+        processes: &mut [Option<ProcessSlot>],
+    ) -> (Vec<EngineStatsSnapshot>, u64, bool) {
         let mut all_dead = true;
-        let mut stats: Vec<EngineStats> = Vec::with_capacity(self.engines.len());
-        let mut any_loading = false;
+        let mut snapshots = Vec::with_capacity(self.engines.len());
 
         for (i, engine) in self.engines.iter().enumerate() {
-            let alive = engine
-                .process_indices
-                .iter()
-                .any(|&i| processes[i].try_wait().unwrap_or(None).is_none());
+            let alive = engine.process_indices.iter().any(|&idx| {
+                processes
+                    .get_mut(idx)
+                    .and_then(|o| o.as_mut())
+                    .is_some_and(|ps| ps.child.try_wait().unwrap_or(None).is_none())
+            });
             if alive {
                 all_dead = false;
             }
@@ -125,28 +407,638 @@ impl Dashboard {
             };
             es.alive = alive;
             es.crashes = es.crashes.saturating_sub(self.baseline_crashes[i]);
-            if es.loading {
-                any_loading = true;
-            }
-            stats.push(es);
+
+            snapshots.push(EngineStatsSnapshot {
+                name: engine.name.clone(),
+                alive: es.alive,
+                loading: es.loading,
+                status_hint: es.status_hint,
+                execs_per_sec: es.execs_per_sec,
+                corpus_count: es.corpus_count,
+                crashes: es.crashes,
+            });
         }
 
-        // Track when loading started for the elapsed timer.
-        if any_loading && self.loading_since.is_none() {
-            self.loading_since = Some(Instant::now());
-        } else if !any_loading {
-            self.loading_since = None;
-        }
-
-        let engines_with_corpus = stats.iter().filter(|s| s.corpus_count > 0).count() as u64;
+        let engines_with_corpus = snapshots.iter().filter(|s| s.corpus_count > 0).count() as u64;
         let corpus_count = if engines_with_corpus > 0 {
-            stats.iter().map(|s| s.corpus_count).sum::<u64>() / engines_with_corpus
+            snapshots.iter().map(|s| s.corpus_count).sum::<u64>() / engines_with_corpus
         } else {
             0
         };
-        self.draw(&stats, corpus_count);
 
-        all_dead
+        (snapshots, corpus_count, all_dead)
+    }
+
+    /// Render an auto-refreshing HTML dashboard page from collected stats.
+    pub fn render_html(
+        &self,
+        stats: &[EngineStatsSnapshot],
+        corpus_count: u64,
+        processes: &[Option<ProcessSlot>],
+        active_tab: &str,
+    ) -> String {
+        let elapsed = self.start_time.elapsed();
+        let total_crashes: u64 = stats.iter().map(|s| s.crashes).sum();
+
+        // HTML-escape target name
+        let target_escaped = self
+            .target
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;");
+
+        // Collect per-worker AFL stats for sub-row display
+        let afl_worker_stats: HashMap<u32, EngineStats> = {
+            let has_afl = self
+                .engines
+                .iter()
+                .any(|e| matches!(e.kind, EngineKind::Afl));
+            if has_afl {
+                self.read_afl_all_stats().1
+            } else {
+                HashMap::new()
+            }
+        };
+
+        let mut buf = String::with_capacity(2048);
+        let _ = write!(
+            buf,
+            r#"<!DOCTYPE html>
+<html><head>
+<meta charset="utf-8">
+<meta http-equiv="refresh" content="2;url=/?tab={active_tab}">
+<title>multifuzz — {target_escaped}</title>
+<style>
+body {{ font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }}
+h1 {{ color: #00d4ff; }}
+table {{ border-collapse: collapse; margin: 10px 0; }}
+th, td {{ padding: 4px 12px; text-align: right; border-bottom: 1px solid #333; }}
+th {{ color: #888; text-align: right; }}
+td:first-child, th:first-child {{ text-align: left; }}
+.alive {{ color: #4caf50; }}
+.dead {{ color: #f44336; }}
+.loading {{ color: #ff9800; }}
+a {{ color: #00d4ff; text-decoration: none; margin-right: 12px; }}
+a:hover {{ text-decoration: underline; }}
+.actions {{ margin-top: 16px; }}
+.syncing {{ color: #ff9800; font-weight: bold; }}
+select, button {{ font-family: monospace; background: #16213e; color: #e0e0e0; border: 1px solid #555; padding: 4px 8px; cursor: pointer; }}
+button:hover {{ background: #1a3a5c; }}
+svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
+.worker-row td:first-child {{ padding-left: 28px; font-size: 0.9em; color: #aaa; }}
+.paused {{ color: #ff9800; }}
+.action-btn {{ font-family: monospace; background: #16213e; color: #e0e0e0; border: 1px solid #555; padding: 2px 8px; cursor: pointer; font-size: 0.85em; text-decoration: none; margin-right: 4px; }}
+.action-btn:hover {{ background: #1a3a5c; }}
+.action-btn.danger {{ border-color: #f44336; }}
+.action-btn.danger:hover {{ background: #5c1a1a; }}
+.path-copy {{ cursor:pointer; border-bottom: 1px dotted #888; }}
+.path-copy:hover {{ color: #00d4ff; }}
+.tab-bar {{ margin: 10px 0; }}
+.tab {{ padding: 4px 12px; color: #888; text-decoration: none; margin-right: 4px; border-bottom: 2px solid transparent; }}
+.tab:hover {{ color: #e0e0e0; }}
+.tab.active {{ background: #16213e; color: #00d4ff; border-bottom: 2px solid #00d4ff; }}
+</style>
+</head><body>
+"#
+        );
+
+        let header = format!("multifuzz &mdash; {target_escaped}");
+        let _ = writeln!(buf, "<h1>{header}</h1>");
+        let _ = writeln!(buf, "<p>Runtime: {}</p>", fmt_duration(elapsed));
+
+        let last_sync_str = self.last_sync.as_deref().unwrap_or("&mdash;");
+        let _ = writeln!(
+            buf,
+            "<p>Last sync: {last_sync_str} (every {} min)</p>",
+            self.sync_interval
+        );
+        let corpus_dir = &self.corpus_dir;
+        let _ = writeln!(
+            buf,
+            "<p><span class=\"path-copy\" title=\"{corpus_dir}\" \
+             onclick=\"navigator.clipboard.writeText('{corpus_dir}')\">Corpus:</span> {corpus_count} files (shared)</p>"
+        );
+        for ext_dir in &self.external_corpus {
+            let ext_count = count_files(ext_dir);
+            let _ = writeln!(
+                buf,
+                "<p><span class=\"path-copy\" title=\"{ext_dir}\" \
+                 onclick=\"navigator.clipboard.writeText('{ext_dir}')\">External:</span> {ext_dir} ({ext_count} files)</p>"
+            );
+        }
+        let crash_dir = &self.crash_dir;
+        let _ = writeln!(
+            buf,
+            "<p><span class=\"path-copy\" title=\"{crash_dir}\" \
+             onclick=\"navigator.clipboard.writeText('{crash_dir}')\">Crashes:</span> {total_crashes}</p>"
+        );
+        if self.syncing {
+            let _ = writeln!(buf, "<p class=\"syncing\">syncing corpus...</p>");
+        }
+
+        let _ = writeln!(
+            buf,
+            "<table><tr><th>Engine</th><th>Status</th><th>Exec/s</th><th>Corpus</th><th>Crashes</th><th>Actions</th></tr>"
+        );
+        for (ei, es) in stats.iter().enumerate() {
+            let engine = &self.engines[ei];
+            let status = if es.loading && es.alive {
+                let hint = es.status_hint.as_deref().unwrap_or("syncing corpus");
+                format!("<span class=\"loading\">{hint}</span>")
+            } else if !es.alive {
+                "<span class=\"dead\">dead</span>".to_string()
+            } else if let Some(ref hint) = es.status_hint {
+                format!("<span class=\"loading\">{hint}</span>")
+            } else {
+                "<span class=\"alive\">alive</span>".to_string()
+            };
+            let exec_s = if !es.alive || es.execs_per_sec <= 0.0 {
+                "-".to_string()
+            } else {
+                format!("{:.0}", es.execs_per_sec)
+            };
+
+            if matches!(engine.kind, EngineKind::Afl) {
+                // AFL header row with aggregate stats
+                let _ = writeln!(
+                    buf,
+                    "<tr><td><b>AFL++</b></td><td>{status}</td><td></td><td></td><td></td><td></td></tr>",
+                );
+
+                // Per-worker sub-rows (only in switchable mode)
+                if self.show_switch_hints {
+                    for (pos, &slot_idx) in engine.process_indices.iter().enumerate() {
+                        let is_main = pos == 0;
+                        let (label, job_num) = if is_main {
+                            ("main".to_string(), Some(0u32))
+                        } else if let Some(Some(ps)) = processes.get(slot_idx) {
+                            match ps.job_num {
+                                Some(n) => (format!("secondary #{n}"), Some(n)),
+                                None => (format!("worker #{pos}"), None),
+                            }
+                        } else {
+                            (format!("worker #{pos}"), None)
+                        };
+
+                        let (worker_status, is_paused) = match processes.get(slot_idx) {
+                            Some(Some(ps)) if ps.paused => {
+                                ("<span class=\"paused\">paused</span>", true)
+                            }
+                            Some(Some(_)) => ("<span class=\"alive\">alive</span>", false),
+                            _ => ("<span class=\"dead\">dead</span>", false),
+                        };
+
+                        // Per-worker stats from fuzzer_stats files
+                        let (w_exec, w_corpus, w_crashes) = if let Some(jn) = job_num {
+                            if let Some(ws) = afl_worker_stats.get(&jn) {
+                                let baseline =
+                                    self.baseline_worker_crashes.get(&jn).copied().unwrap_or(0);
+                                let crashes = ws.crashes.saturating_sub(baseline);
+                                (
+                                    if ws.execs_per_sec > 0.0 {
+                                        format!("{:.0}", ws.execs_per_sec)
+                                    } else {
+                                        "-".to_string()
+                                    },
+                                    format!("{}", ws.corpus_count),
+                                    format!("{crashes}"),
+                                )
+                            } else {
+                                ("-".to_string(), "-".to_string(), "-".to_string())
+                            }
+                        } else {
+                            ("-".to_string(), "-".to_string(), "-".to_string())
+                        };
+
+                        let mut actions = String::new();
+                        if let Some(Some(_)) = processes.get(slot_idx) {
+                            if is_paused {
+                                let _ = write!(actions, "<a class=\"action-btn\" href=\"/resume?slot={slot_idx}\">resume</a>");
+                            } else {
+                                let _ = write!(actions, "<a class=\"action-btn\" href=\"/pause?slot={slot_idx}\">pause</a>");
+                            }
+                            if !is_main {
+                                let _ = write!(actions, "<a class=\"action-btn danger\" href=\"/remove?slot={slot_idx}\">remove</a>");
+                            }
+                        }
+
+                        let _ = writeln!(
+                            buf,
+                            "<tr class=\"worker-row\"><td>{label}</td><td>{worker_status}</td><td>{w_exec}</td><td>{w_corpus}</td><td>{w_crashes}</td><td>{actions}</td></tr>"
+                        );
+                    }
+                    // "Add worker" row
+                    let _ = writeln!(
+                        buf,
+                        "<tr class=\"worker-row\"><td></td><td></td><td></td><td></td><td></td><td><a class=\"action-btn\" href=\"/scale?e=afl&amp;d=1\">+ add AFL++ worker</a></td></tr>"
+                    );
+                }
+            } else {
+                // honggfuzz / libfuzzer: single row with pause/resume
+                let mut actions = String::new();
+                if self.show_switch_hints {
+                    if let Some(&slot_idx) = engine.process_indices.first() {
+                        if let Some(Some(ps)) = processes.get(slot_idx) {
+                            if ps.paused {
+                                let _ = write!(actions, "<a class=\"action-btn\" href=\"/resume?slot={slot_idx}\">resume</a>");
+                            } else {
+                                let _ = write!(actions, "<a class=\"action-btn\" href=\"/pause?slot={slot_idx}\">pause</a>");
+                            }
+                        }
+                    }
+                }
+                let _ = writeln!(
+                    buf,
+                    "<tr><td>{}</td><td>{status}</td><td>{exec_s}</td><td>{}</td><td>{}</td><td>{actions}</td></tr>",
+                    es.name, es.corpus_count, es.crashes
+                );
+            }
+        }
+        let _ = writeln!(buf, "</table>");
+
+        // Graphs section — tabbed
+        let tabs = [
+            ("exec", "Exec/s"),
+            ("corpus", "Corpus"),
+            ("cpu", "CPU"),
+            ("mem", "Memory"),
+        ];
+        let _ = write!(buf, "<div class=\"tab-bar\">");
+        for (id, label) in &tabs {
+            let cls = if *id == active_tab {
+                "tab active"
+            } else {
+                "tab"
+            };
+            let _ = write!(buf, "<a href=\"/?tab={id}\" class=\"{cls}\">{label}</a>");
+        }
+        let _ = writeln!(buf, "</div>");
+
+        let graph_names: Vec<&str> = self.graph_labels.iter().map(|s| s.as_str()).collect();
+        let graph_colors: Vec<&str> = self.graph_colors.iter().map(|s| s.as_str()).collect();
+        match active_tab {
+            "exec" => self.render_line_chart(
+                &mut buf,
+                "Exec/s",
+                "exec/s",
+                &self.exec_history,
+                &graph_names,
+                &graph_colors,
+            ),
+            "corpus" => self.render_scalar_chart(
+                &mut buf,
+                "Corpus Size",
+                "files",
+                &self.corpus_history,
+                "#00d4ff",
+            ),
+            "cpu" => self.render_line_chart(
+                &mut buf,
+                "CPU Usage",
+                "%",
+                &self.cpu_history,
+                &graph_names,
+                &graph_colors,
+            ),
+            _ => self.render_line_chart(
+                &mut buf,
+                "Memory (RSS)",
+                "MiB",
+                &self.mem_history,
+                &graph_names,
+                &graph_colors,
+            ),
+        }
+
+        // Strategy + Stop
+        let _ = writeln!(buf, "<div class=\"actions\">");
+        if self.show_switch_hints {
+            let _ = writeln!(buf, "<h2>Strategy</h2>");
+            let cur = self.current_strategy.unwrap_or(Strategy::Parallel);
+            let options = [
+                (Strategy::Parallel, "parallel", "Parallel"),
+                (Strategy::AflOnly, "afl-only", "AFL++ only"),
+                (Strategy::HonggOnly, "hongg-only", "honggfuzz only"),
+                (Strategy::LibfuzzerOnly, "libfuzzer-only", "libfuzzer only"),
+            ];
+            let _ = write!(
+                buf,
+                "<form method=\"get\" action=\"/switch\" style=\"display:inline\">"
+            );
+            let _ = write!(buf, "<select name=\"s\">");
+            for (strat, value, label) in &options {
+                let selected = if *strat == cur { " selected" } else { "" };
+                let _ = write!(buf, "<option value=\"{value}\"{selected}>{label}</option>");
+            }
+            let _ = write!(buf, "</select> ");
+            let _ = write!(buf, "<button type=\"submit\">Switch</button>");
+            let _ = write!(buf, "</form> ");
+        }
+        let _ = writeln!(
+            buf,
+            "<form method=\"get\" action=\"/stop\" style=\"display:inline\"><button type=\"submit\" style=\"border-color:#f44336;color:#f44336\">Stop</button></form>"
+        );
+        let _ = writeln!(buf, "</div>");
+
+        // Logs section
+        let _ = writeln!(
+            buf,
+            "<div class=\"logs-section\" style=\"margin-top:16px\">"
+        );
+        let _ = writeln!(buf, "<h2>Logs</h2>");
+        let _ = write!(
+            buf,
+            "<form method=\"get\" action=\"/logs\" target=\"_blank\"><select name=\"f\">"
+        );
+        for engine in &self.engines {
+            match engine.kind {
+                EngineKind::Afl => {
+                    for &idx in &engine.process_indices {
+                        if let Some(Some(ps)) = processes.get(idx) {
+                            let jn = ps.job_num.unwrap_or(0);
+                            if jn == 0 {
+                                let _ = write!(buf, "<option value=\"afl\">AFL++ main</option>");
+                            } else {
+                                let _ = write!(
+                                    buf,
+                                    "<option value=\"afl_{jn}\">AFL++ secondary #{jn}</option>"
+                                );
+                            }
+                        }
+                    }
+                }
+                EngineKind::Honggfuzz => {
+                    let _ = write!(buf, "<option value=\"honggfuzz\">honggfuzz</option>");
+                }
+                EngineKind::Libfuzzer => {
+                    let _ = write!(buf, "<option value=\"libfuzzer\">libfuzzer</option>");
+                }
+            }
+        }
+        let _ = write!(
+            buf,
+            "</select> <button type=\"submit\">Show Logs</button></form>"
+        );
+        let _ = writeln!(buf, "</div>");
+
+        let _ = writeln!(
+            buf,
+            "<script>\
+document.querySelectorAll('.path-copy').forEach(function(el){{\
+el.addEventListener('click',function(){{\
+var r=el.getBoundingClientRect();\
+var t=document.createElement('span');\
+t.textContent='Copied!';\
+t.style.cssText='position:fixed;top:'+(r.top-24)+'px;left:'+(r.left+r.width/2)+'px;\
+transform:translateX(-50%);background:#00d4ff;color:#0a0e27;padding:2px 8px;border-radius:4px;\
+font-size:11px;pointer-events:none;z-index:9999;opacity:1;transition:opacity 0.4s';\
+document.body.appendChild(t);\
+setTimeout(function(){{t.style.opacity='0'}},600);\
+setTimeout(function(){{t.remove()}},1000);\
+}});\
+}});\
+</script>"
+        );
+        let _ = writeln!(buf, "</body></html>");
+        buf
+    }
+
+    // ── chart rendering ─────────────────────────────────────────────────
+
+    fn render_line_chart(
+        &self,
+        buf: &mut String,
+        title: &str,
+        y_label: &str,
+        data: &VecDeque<TimeSeriesSample>,
+        engine_names: &[&str],
+        colors: &[&str],
+    ) {
+        if data.is_empty() {
+            return;
+        }
+
+        let (left, right, top, bottom) = (60.0_f64, 780.0, 10.0, 180.0);
+        let min_t = data.front().unwrap().elapsed_secs;
+        let max_t = data.back().unwrap().elapsed_secs;
+        let t_range = (max_t - min_t).max(1.0);
+
+        // Find y_max across all series
+        let y_max = {
+            let raw = data
+                .iter()
+                .flat_map(|s| s.per_engine.iter().copied())
+                .fold(0.0_f64, f64::max);
+            round_up_nice(raw.max(1.0))
+        };
+
+        let _ = writeln!(
+            buf,
+            "<svg viewBox=\"0 0 800 200\" width=\"100%\" style=\"max-width:820px;margin:8px 0\">"
+        );
+        let _ = writeln!(
+            buf,
+            "<rect width=\"800\" height=\"200\" fill=\"#16213e\" rx=\"4\"/>"
+        );
+
+        // Title
+        let _ = writeln!(
+            buf,
+            "<text x=\"{left}\" y=\"{top}\" dy=\"10\" fill=\"#e0e0e0\" font-size=\"12\">{title}</text>"
+        );
+
+        // Grid lines + Y labels
+        for i in 0..=3 {
+            let frac = i as f64 / 3.0;
+            let y = bottom - frac * (bottom - top - 14.0);
+            let val = y_max * frac;
+            let _ = writeln!(
+                buf,
+                "<line x1=\"{left}\" y1=\"{y}\" x2=\"{right}\" y2=\"{y}\" stroke=\"#333\" stroke-dasharray=\"4\"/>"
+            );
+            let label = format_compact(val);
+            let _ = writeln!(
+                buf,
+                "<text x=\"{lx}\" y=\"{y}\" dy=\"3\" text-anchor=\"end\">{label}</text>",
+                lx = left - 4.0
+            );
+        }
+
+        // Y-axis label
+        let _ = writeln!(
+            buf,
+            "<text x=\"14\" y=\"100\" transform=\"rotate(-90,14,100)\" text-anchor=\"middle\" font-size=\"10\">{y_label}</text>"
+        );
+
+        // X-axis time labels
+        render_x_labels(buf, min_t, max_t, left, right, bottom);
+
+        // Sync bands
+        self.render_sync_bands(buf, min_t, t_range, left, right, top, bottom);
+
+        // Downsample
+        let step = if data.len() > 600 {
+            data.len() / 300
+        } else {
+            1
+        };
+
+        // Polylines per engine
+        for (ei, color) in colors.iter().enumerate().take(engine_names.len()) {
+            let mut points = String::new();
+            for (j, sample) in data.iter().enumerate() {
+                if j % step != 0 && j != data.len() - 1 {
+                    continue;
+                }
+                let val = sample.per_engine.get(ei).copied().unwrap_or(0.0);
+                let x = left + (sample.elapsed_secs - min_t) / t_range * (right - left);
+                let y = bottom - (val / y_max) * (bottom - top - 14.0);
+                let _ = write!(points, "{x:.1},{y:.1} ");
+            }
+            let _ = writeln!(
+                buf,
+                "<polyline points=\"{points}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"1.5\"/>"
+            );
+        }
+
+        // Legend (top-right)
+        let n_engines = engine_names.len().min(colors.len());
+        for (ei, (name, color)) in engine_names
+            .iter()
+            .zip(colors.iter())
+            .enumerate()
+            .take(n_engines)
+        {
+            let lx = right - 10.0;
+            let ly = top + 14.0 + ei as f64 * 14.0;
+            let _ = writeln!(
+                buf,
+                "<rect x=\"{rx}\" y=\"{ry}\" width=\"8\" height=\"8\" fill=\"{color}\"/>",
+                rx = lx - 10.0,
+                ry = ly - 7.0
+            );
+            let _ = writeln!(
+                buf,
+                "<text x=\"{lx}\" y=\"{ly}\" text-anchor=\"end\" font-size=\"9\" dx=\"-14\">{name}</text>"
+            );
+        }
+
+        let _ = writeln!(buf, "</svg>");
+    }
+
+    fn render_scalar_chart(
+        &self,
+        buf: &mut String,
+        title: &str,
+        y_label: &str,
+        data: &VecDeque<ScalarSample>,
+        color: &str,
+    ) {
+        if data.is_empty() {
+            return;
+        }
+
+        let (left, right, top, bottom) = (60.0_f64, 780.0, 10.0, 180.0);
+        let min_t = data.front().unwrap().elapsed_secs;
+        let max_t = data.back().unwrap().elapsed_secs;
+        let t_range = (max_t - min_t).max(1.0);
+
+        let y_max = {
+            let raw = data.iter().map(|s| s.value).fold(0.0_f64, f64::max);
+            round_up_nice(raw.max(1.0))
+        };
+
+        let _ = writeln!(
+            buf,
+            "<svg viewBox=\"0 0 800 200\" width=\"100%\" style=\"max-width:820px;margin:8px 0\">"
+        );
+        let _ = writeln!(
+            buf,
+            "<rect width=\"800\" height=\"200\" fill=\"#16213e\" rx=\"4\"/>"
+        );
+
+        let _ = writeln!(
+            buf,
+            "<text x=\"{left}\" y=\"{top}\" dy=\"10\" fill=\"#e0e0e0\" font-size=\"12\">{title}</text>"
+        );
+
+        for i in 0..=3 {
+            let frac = i as f64 / 3.0;
+            let y = bottom - frac * (bottom - top - 14.0);
+            let val = y_max * frac;
+            let label = format_compact(val);
+            let _ = writeln!(
+                buf,
+                "<line x1=\"{left}\" y1=\"{y}\" x2=\"{right}\" y2=\"{y}\" stroke=\"#333\" stroke-dasharray=\"4\"/>"
+            );
+            let _ = writeln!(
+                buf,
+                "<text x=\"{lx}\" y=\"{y}\" dy=\"3\" text-anchor=\"end\">{label}</text>",
+                lx = left - 4.0
+            );
+        }
+
+        let _ = writeln!(
+            buf,
+            "<text x=\"14\" y=\"100\" transform=\"rotate(-90,14,100)\" text-anchor=\"middle\" font-size=\"10\">{y_label}</text>"
+        );
+
+        render_x_labels(buf, min_t, max_t, left, right, bottom);
+        self.render_sync_bands(buf, min_t, t_range, left, right, top, bottom);
+
+        let step = if data.len() > 600 {
+            data.len() / 300
+        } else {
+            1
+        };
+
+        let mut points = String::new();
+        for (j, sample) in data.iter().enumerate() {
+            if j % step != 0 && j != data.len() - 1 {
+                continue;
+            }
+            let x = left + (sample.elapsed_secs - min_t) / t_range * (right - left);
+            let y = bottom - (sample.value / y_max) * (bottom - top - 14.0);
+            let _ = write!(points, "{x:.1},{y:.1} ");
+        }
+        let _ = writeln!(
+            buf,
+            "<polyline points=\"{points}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"1.5\"/>"
+        );
+
+        let _ = writeln!(buf, "</svg>");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn render_sync_bands(
+        &self,
+        buf: &mut String,
+        min_t: f64,
+        t_range: f64,
+        left: f64,
+        right: f64,
+        top: f64,
+        bottom: f64,
+    ) {
+        for sp in &self.sync_periods {
+            let x1 = left + (sp.start_secs - min_t) / t_range * (right - left);
+            let x2 = if let Some(end) = sp.end_secs {
+                left + (end - min_t) / t_range * (right - left)
+            } else {
+                right
+            };
+            let x1 = x1.max(left);
+            let x2 = x2.min(right);
+            if x2 > x1 {
+                let _ = writeln!(
+                    buf,
+                    "<rect x=\"{x1:.1}\" y=\"{top}\" width=\"{w:.1}\" height=\"{h}\" fill=\"rgba(255,152,0,0.15)\"/>",
+                    w = x2 - x1,
+                    h = bottom - top
+                );
+            }
+        }
     }
 
     // ── stat readers ─────────────────────────────────────────────────────
@@ -162,8 +1054,6 @@ impl Dashboard {
             status_hint: None,
         };
 
-        // The engine name encodes the instance dir; for the aggregate view we
-        // glob all instances under the afl output dir.
         let pattern = format!("{}/afl/*/fuzzer_stats", self.output_target);
         let mut found_stats = false;
         for path in glob::glob(&pattern).into_iter().flatten().flatten() {
@@ -190,12 +1080,10 @@ impl Dashboard {
             }
         }
 
-        // No fuzzer_stats yet → AFL++ is still doing dry runs / importing seeds.
         if !found_stats {
             let log_path = format!("{}/logs/afl.log", self.output_target);
             let tail = tail_file(&log_path, 4096);
             if tail.contains("Attempting dry run") {
-                // Count how many dry runs we've seen
                 let done = tail.matches("Attempting dry run").count();
                 total.status_hint = Some(format!("importing seeds ({done})"));
                 total.loading = true;
@@ -209,8 +1097,87 @@ impl Dashboard {
         total
     }
 
-    /// Parse honggfuzz TUI log. Labels like "Speed : " are clean ASCII; values
-    /// are wrapped in ANSI bold/reset sequences which we strip before parsing.
+    /// Parse AFL++ `fuzzer_stats` for all workers individually, returning
+    /// aggregate stats and a per-worker map keyed by job_num.
+    fn read_afl_all_stats(&self) -> (EngineStats, HashMap<u32, EngineStats>) {
+        let mut total = EngineStats {
+            execs_per_sec: 0.0,
+            corpus_count: 0,
+            crashes: 0,
+            alive: false,
+            loading: false,
+            status_hint: None,
+        };
+        let mut per_worker: HashMap<u32, EngineStats> = HashMap::new();
+
+        let pattern = format!("{}/afl/*/fuzzer_stats", self.output_target);
+        let mut found_stats = false;
+        for path in glob::glob(&pattern).into_iter().flatten().flatten() {
+            let dir_name = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let job_num = if dir_name == "mainaflfuzzer" {
+                0u32
+            } else if let Some(suffix) = dir_name.strip_prefix("secondaryfuzzer") {
+                suffix.parse::<u32>().unwrap_or(u32::MAX)
+            } else {
+                continue;
+            };
+
+            if let Ok(contents) = fs::read_to_string(&path) {
+                found_stats = true;
+                let mut ws = EngineStats {
+                    execs_per_sec: 0.0,
+                    corpus_count: 0,
+                    crashes: 0,
+                    alive: false,
+                    loading: false,
+                    status_hint: None,
+                };
+                for line in contents.lines() {
+                    if let Some((key, val)) = line.split_once(':') {
+                        let key = key.trim();
+                        let val = val.trim();
+                        match key {
+                            "execs_per_sec" => {
+                                ws.execs_per_sec = val.parse::<f64>().unwrap_or(0.0);
+                            }
+                            "corpus_count" => {
+                                ws.corpus_count = val.parse::<u64>().unwrap_or(0);
+                            }
+                            "saved_crashes" => {
+                                ws.crashes = val.parse::<u64>().unwrap_or(0);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                total.execs_per_sec += ws.execs_per_sec;
+                total.corpus_count += ws.corpus_count;
+                total.crashes += ws.crashes;
+                per_worker.insert(job_num, ws);
+            }
+        }
+
+        if !found_stats {
+            let log_path = format!("{}/logs/afl.log", self.output_target);
+            let tail = tail_file(&log_path, 4096);
+            if tail.contains("Attempting dry run") {
+                let done = tail.matches("Attempting dry run").count();
+                total.status_hint = Some(format!("importing seeds ({done})"));
+                total.loading = true;
+            } else if !tail.is_empty() {
+                total.status_hint = Some("starting".to_string());
+                total.loading = true;
+            }
+        }
+
+        (total, per_worker)
+    }
+
+    /// Parse honggfuzz TUI log.
     fn read_honggfuzz_stats(&self) -> EngineStats {
         let mut stats = EngineStats {
             execs_per_sec: 0.0,
@@ -222,14 +1189,25 @@ impl Dashboard {
         };
 
         let log_path = format!("{}/logs/honggfuzz.log", self.output_target);
-        let tail = tail_file(&log_path, 8192);
+        let tail = tail_file(&log_path, 32768);
 
-        // Search for the last occurrence of each label in the raw output.
         if let Some(v) = rfind_after(&tail, "Speed : ") {
-            // "\x1b[1m64/sec\x1b[0m ..." → "64"
             let clean = strip_ansi_inline(v);
+            // Parse instantaneous speed: "N/sec [avg: M]"
             if let Some(num) = clean.split('/').next() {
                 stats.execs_per_sec = parse_num(num);
+            }
+            // Fallback to average speed if instantaneous is 0
+            if stats.execs_per_sec == 0.0 {
+                if let Some(avg) = clean.find("avg: ").map(|i| &clean[i + 5..]) {
+                    let avg_num: String = avg
+                        .chars()
+                        .take_while(|c| c.is_ascii_digit() || *c == ',')
+                        .collect();
+                    if !avg_num.is_empty() {
+                        stats.execs_per_sec = parse_num(&avg_num);
+                    }
+                }
             }
         }
         if let Some(v) = rfind_after(&tail, "Crashes : ") {
@@ -239,7 +1217,6 @@ impl Dashboard {
             }
         }
         if let Some(v) = rfind_after(&tail, "Corpus Size : ") {
-            // "2,666, max: ..." — grab everything up to first non-digit/non-comma
             let clean = strip_ansi_inline(v);
             let num: String = clean
                 .chars()
@@ -248,7 +1225,6 @@ impl Dashboard {
             stats.corpus_count = parse_num(&num) as u64;
         }
 
-        // Detect startup phases when we have no real stats yet.
         if stats.execs_per_sec == 0.0 {
             if tail.contains("Loading dynamic input file") {
                 stats.loading = true;
@@ -278,7 +1254,6 @@ impl Dashboard {
         let log_path = format!("{}/logs/libfuzzer.log", self.output_target);
         let tail = tail_file(&log_path, 8192);
 
-        // Lines look like: #12345\tNEW    cov: 123 ft: 456 corp: 789/1234b exec/s: 5678
         for line in tail.lines().rev() {
             if stats.execs_per_sec == 0.0 {
                 if let Some(v) = extract_after(line, "exec/s: ") {
@@ -289,8 +1264,6 @@ impl Dashboard {
             }
             if stats.corpus_count == 0 {
                 if let Some(v) = extract_after(line, "corp: ") {
-                    // Fork mode: "19725 exec/s: ..."
-                    // Normal mode: "789/1234b exec/s: ..."
                     if let Some(num) = v.split(|c: char| !c.is_ascii_digit()).next() {
                         stats.corpus_count = parse_num(num) as u64;
                     }
@@ -298,108 +1271,135 @@ impl Dashboard {
             }
         }
 
-        // Count crash files for libfuzzer.
         stats.crashes = count_files(&format!("{}/libfuzzer/crashes", self.output_target));
 
         stats
     }
+}
 
-    // ── drawing ──────────────────────────────────────────────────────────
+// ── /proc readers ───────────────────────────────────────────────────────
 
-    fn draw(&self, stats: &[EngineStats], corpus_count: u64) {
-        let elapsed = self.start_time.elapsed();
-        let total_crashes: u64 = stats.iter().map(|s| s.crashes).sum();
+/// Sum utime + stime + cutime + cstime from /proc/{pid}/stat.
+/// cutime/cstime include CPU time of waited-for children (forkserver targets).
+fn read_proc_cpu_jiffies(pid: u32) -> u64 {
+    let path = format!("/proc/{pid}/stat");
+    let Ok(contents) = fs::read_to_string(path) else {
+        return 0;
+    };
+    // Fields after the comm "(name)" to avoid spaces in process name
+    let Some(rest) = contents.rfind(')').map(|i| &contents[i + 2..]) else {
+        return 0;
+    };
+    let fields: Vec<&str> = rest.split_whitespace().collect();
+    // After closing paren: field 11 = utime, 12 = stime, 13 = cutime, 14 = cstime
+    let utime = fields
+        .get(11)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let stime = fields
+        .get(12)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let cutime = fields
+        .get(13)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let cstime = fields
+        .get(14)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    utime + stime + cutime + cstime
+}
 
-        let mut buf = String::with_capacity(1024);
+/// RSS in bytes from /proc/{pid}/statm field 1, multiplied by page_size.
+fn read_proc_rss_bytes(pid: u32, page_size: usize) -> u64 {
+    let path = format!("/proc/{pid}/statm");
+    let Ok(contents) = fs::read_to_string(path) else {
+        return 0;
+    };
+    let rss_pages = contents
+        .split_whitespace()
+        .nth(1)
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    rss_pages * page_size as u64
+}
 
-        // Clear screen + move cursor home.
-        let _ = write!(buf, "\x1b[2J\x1b[H");
+// ── chart helpers ───────────────────────────────────────────────────────
 
-        let header = if let Some(ref label) = self.phase_label {
-            format!("── multifuzz ── {} ({}) ", self.target, label)
-        } else {
-            format!("── multifuzz ── {} ", self.target)
-        };
+/// Round a value up to a "nice" number for Y-axis max.
+fn round_up_nice(v: f64) -> f64 {
+    if v <= 0.0 {
+        return 1.0;
+    }
+    let mag = 10.0_f64.powf(v.log10().floor());
+    let norm = v / mag;
+    let nice = if norm <= 1.0 {
+        1.0
+    } else if norm <= 2.0 {
+        2.0
+    } else if norm <= 5.0 {
+        5.0
+    } else {
+        10.0
+    };
+    nice * mag
+}
+
+/// Format a number compactly for axis labels.
+fn format_compact(v: f64) -> String {
+    if v >= 1_000_000.0 {
+        format!("{:.1}M", v / 1_000_000.0)
+    } else if v >= 1_000.0 {
+        format!("{:.1}K", v / 1_000.0)
+    } else if v == v.floor() {
+        format!("{:.0}", v)
+    } else {
+        format!("{:.1}", v)
+    }
+}
+
+/// Format elapsed seconds as `Xm` or `XhYm`.
+fn fmt_elapsed_short(secs: f64) -> String {
+    let total = secs as u64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    if h > 0 {
+        format!("{h}h{m:02}m")
+    } else {
+        format!("{m}m")
+    }
+}
+
+fn render_x_labels(buf: &mut String, min_t: f64, max_t: f64, left: f64, right: f64, bottom: f64) {
+    let t_range = (max_t - min_t).max(1.0);
+    // Aim for ~5 labels
+    let step_secs = (t_range / 5.0).max(30.0);
+    // Round step to a nice interval
+    let step_secs = if step_secs < 60.0 {
+        60.0
+    } else if step_secs < 300.0 {
+        300.0
+    } else {
+        600.0
+    };
+    let mut t = (min_t / step_secs).ceil() * step_secs;
+    while t <= max_t {
+        let x = left + (t - min_t) / t_range * (right - left);
+        let label = fmt_elapsed_short(t);
         let _ = writeln!(
             buf,
-            "\x1b[1m{header}{}\x1b[0m",
-            "─".repeat(60usize.saturating_sub(header.len()))
+            "<text x=\"{x:.1}\" y=\"{y}\" text-anchor=\"middle\">{label}</text>",
+            y = bottom + 14.0
         );
-        let _ = writeln!(buf, " Runtime : {}", fmt_duration(elapsed));
-        let last_sync_str = self.last_sync.as_deref().unwrap_or("—");
-        let _ = writeln!(
-            buf,
-            " Last sync: {last_sync_str} (every {} min)",
-            self.sync_interval
-        );
-        let _ = writeln!(buf, " Corpus  : {} files (shared)", corpus_count);
-        let _ = writeln!(buf, " Crashes : {total_crashes}");
-        if self.syncing {
-            let _ = writeln!(buf, " \x1b[1;33m⟳ syncing corpus...\x1b[0m");
-        }
-        let _ = writeln!(buf);
-
-        // Table header.
-        let _ = writeln!(
-            buf,
-            " {:<20} {:>8} {:>10} {:>8} {:>8}",
-            "Engine", "Status", "Exec/s", "Corpus", "Crashes"
-        );
-        let _ = writeln!(buf, " {}", "─".repeat(58));
-
-        let spinner_frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        let spinner_idx = elapsed.as_secs() as usize % spinner_frames.len();
-        let spinner = spinner_frames[spinner_idx];
-
-        for (engine, es) in self.engines.iter().zip(stats.iter()) {
-            if es.loading && es.alive {
-                let loading_elapsed = self.loading_since.map(|t| t.elapsed()).unwrap_or_default();
-                let ls = loading_elapsed.as_secs();
-                let hint = es.status_hint.as_deref().unwrap_or("syncing corpus");
-                let _ = writeln!(
-                    buf,
-                    " {:<20} \x1b[1;33m{spinner} {hint} ({:02}:{:02})\x1b[0m",
-                    engine.name,
-                    ls / 60,
-                    ls % 60,
-                );
-                continue;
-            }
-            let status = if !es.alive {
-                "\x1b[31mdead\x1b[0m "
-            } else if let Some(ref hint) = es.status_hint {
-                // Alive but with a status hint (e.g. "starting")
-                let _ = writeln!(buf, " {:<20} \x1b[33m{hint}\x1b[0m", engine.name,);
-                continue;
-            } else {
-                "\x1b[32malive\x1b[0m"
-            };
-            // exec/s: show "-" when dead or no data yet
-            let exec_s = if !es.alive || es.execs_per_sec <= 0.0 {
-                "-".to_string()
-            } else {
-                format!("{:.0}", es.execs_per_sec)
-            };
-            let _ = writeln!(
-                buf,
-                " {:<20} {:>13} {:>10} {:>8} {:>8}",
-                engine.name, status, exec_s, es.corpus_count, es.crashes
-            );
-        }
-
-        let _ = writeln!(buf, " {}", "─".repeat(58));
-
-        let stderr = io::stderr();
-        let mut handle = stderr.lock();
-        let _ = handle.write_all(buf.as_bytes());
-        let _ = handle.flush();
+        t += step_secs;
     }
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
 /// Read the last `n` bytes of a file as a string.
-fn tail_file(path: &str, n: u64) -> String {
+pub fn tail_file(path: &str, n: u64) -> String {
     let Ok(mut file) = fs::File::open(path) else {
         return String::new();
     };
@@ -413,14 +1413,13 @@ fn tail_file(path: &str, n: u64) -> String {
 }
 
 /// Find the substring after the *last* occurrence of `prefix` in `haystack`.
-/// Works on raw TUI output where lines may be overwritten by cursor movements.
 fn rfind_after<'a>(haystack: &'a str, prefix: &str) -> Option<&'a str> {
     let idx = haystack.rfind(prefix)?;
     Some(&haystack[idx + prefix.len()..])
 }
 
-/// Strip ANSI escape sequences from a short value string (e.g. "\x1b[1m64/sec\x1b[0m").
-fn strip_ansi_inline(s: &str) -> String {
+/// Strip ANSI escape sequences from a short value string.
+pub fn strip_ansi_inline(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -461,7 +1460,7 @@ fn count_files(dir: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn fmt_duration(d: Duration) -> String {
+pub fn fmt_duration(d: Duration) -> String {
     let total_secs = d.as_secs();
     let days = total_secs / 86400;
     let hrs = (total_secs % 86400) / 3600;

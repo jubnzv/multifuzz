@@ -1,15 +1,18 @@
-use crate::ui::{Dashboard, EngineInfo, EngineKind};
-use crate::{Build, Fuzz, Strategy};
+use crate::ui::{Dashboard, EngineInfo, EngineKind, ProcessSlot};
+use crate::{web, Build, Fuzz, Strategy};
 use anyhow::{anyhow, Context, Result};
 use glob::glob;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     fs::File,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{self, Stdio},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -30,6 +33,19 @@ static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigint(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
+}
+
+enum PhaseExit {
+    Done,
+    SwitchTo(Strategy),
+}
+
+pub enum WebCommand {
+    SwitchStrategy(Strategy),
+    ScaleAfl(i32),
+    PauseSlot(usize),
+    ResumeSlot(usize),
+    RemoveSlot(usize),
 }
 use std::os::unix::process::CommandExt;
 use twox_hash::XxHash64;
@@ -100,8 +116,23 @@ impl Fuzz {
 
     pub fn fuzz(&mut self) -> Result<()> {
         // Validate sequential mode args
-        if matches!(self.strategy, Strategy::Sequential) && self.duration.is_none() {
+        if self.strategy == Strategy::Sequential && self.duration.is_none() {
             return Err(anyhow!("--duration is required with --strategy sequential"));
+        }
+
+        // Validate single-engine strategies against --no-* flags
+        if self.strategy == Strategy::AflOnly && self.no_afl {
+            return Err(anyhow!("--strategy afl-only conflicts with --no-afl"));
+        }
+        if self.strategy == Strategy::HonggOnly && self.no_honggfuzz {
+            return Err(anyhow!(
+                "--strategy hongg-only conflicts with --no-honggfuzz"
+            ));
+        }
+        if self.strategy == Strategy::LibfuzzerOnly && self.no_libfuzzer {
+            return Err(anyhow!(
+                "--strategy libfuzzer-only conflicts with --no-libfuzzer"
+            ));
         }
 
         // Resolve output to an absolute path so all printed paths are absolute.
@@ -143,52 +174,53 @@ impl Fuzz {
 
         let crash_path = Path::new(&crash_dir);
 
-        // Wait for Enter in a background thread so fuzzers run immediately.
-        // Shared across all phases in sequential mode.
-        let dashboard_ready = std::sync::Arc::new(AtomicBool::new(false));
-        {
-            let flag = dashboard_ready.clone();
-            thread::spawn(move || {
-                let _ = std::io::stdin().read_line(&mut String::new());
-                flag.store(true, Ordering::Relaxed);
-            });
+        if !self.no_honggfuzz {
+            self.check_honggfuzz_oversized_files()?;
         }
 
-        unsafe {
-            libc::signal(
-                libc::SIGINT,
-                handle_sigint as *const () as libc::sighandler_t,
+        // Web dashboard setup (optional)
+        let (cmd_rx, web_html, _web_handle) = if self.web {
+            let loading_html = concat!(
+                "<!DOCTYPE html><html><head><meta charset=\"utf-8\">",
+                "<meta http-equiv=\"refresh\" content=\"2\">",
+                "<title>multifuzz</title>",
+                "<style>body{font-family:monospace;background:#1a1a2e;color:#e0e0e0;padding:20px}</style>",
+                "</head><body><h1>multifuzz</h1><p>Starting fuzzers...</p></body></html>",
             );
+            let mut init_map = HashMap::new();
+            for tab in &["exec", "corpus", "cpu", "mem"] {
+                init_map.insert(tab.to_string(), loading_html.to_string());
+            }
+            let html: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(init_map));
+            let (tx, rx) = mpsc::channel::<WebCommand>();
+            let logs_dir = format!("{}/logs", self.output_target());
+            let (handle, port) =
+                web::start_server(self.web_port, html.clone(), tx, &STOP, logs_dir)?;
+            let url = format!("http://127.0.0.1:{port}");
+            eprintln!("    Dashboard: {url}");
+            let _ = process::Command::new("xdg-open")
+                .arg(&url)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn();
+            (Some(rx), Some(html), Some(handle))
+        } else {
+            (None, None, None)
+        };
+
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handle_sigint as libc::sighandler_t;
+            libc::sigemptyset(&mut sa.sa_mask);
+            // No SA_RESTART: interrupted syscalls return EINTR immediately.
+            sa.sa_flags = 0;
+            libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
         }
 
         let loop_start = Instant::now();
 
         match self.strategy {
-            Strategy::Parallel => {
-                let (mut processes, engines) = self.spawn_fuzzers()?;
-
-                self.print_launch_info(&crash_dir);
-
-                let mut dashboard = Dashboard::new(
-                    &self.target,
-                    &self.output_target(),
-                    engines,
-                    self.sync_interval,
-                    None,
-                );
-                dashboard.record_baseline();
-
-                self.run_phase(
-                    &mut processes,
-                    &mut dashboard,
-                    crash_path,
-                    None,
-                    &dashboard_ready,
-                )?;
-
-                self.collect_crashes(crash_path)?;
-                stop_fuzzers(&mut processes)?;
-            }
             Strategy::Sequential => {
                 let duration_mins = self.duration.unwrap();
                 let engine_kinds = self.enabled_engine_kinds();
@@ -220,12 +252,37 @@ impl Fuzz {
 
                     let (mut processes, engines) = self.spawn_single_engine(*kind, self.jobs)?;
 
+                    let afl_jobs = if matches!(kind, EngineKind::Afl) {
+                        self.jobs
+                    } else {
+                        0
+                    };
+                    let abs_corpus = fs::canonicalize(self.corpus_dir())
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| self.corpus_dir());
+                    let abs_external: Vec<String> = self
+                        .external_corpus
+                        .iter()
+                        .map(|p| {
+                            fs::canonicalize(p)
+                                .map(|c| c.display().to_string())
+                                .unwrap_or_else(|_| p.display().to_string())
+                        })
+                        .collect();
+                    let abs_crash = fs::canonicalize(&crash_dir)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| crash_dir.clone());
                     let mut dashboard = Dashboard::new(
                         &self.target,
                         &self.output_target(),
                         engines,
                         self.sync_interval,
-                        Some(phase_label),
+                        false,
+                        None,
+                        afl_jobs,
+                        &abs_corpus,
+                        abs_external,
+                        &abs_crash,
                     );
                     dashboard.record_baseline();
 
@@ -235,15 +292,82 @@ impl Fuzz {
                         &mut dashboard,
                         crash_path,
                         Some(phase_dur),
-                        &dashboard_ready,
+                        cmd_rx.as_ref(),
+                        web_html.as_ref(),
                     )?;
 
-                    self.collect_crashes(crash_path)?;
                     stop_fuzzers(&mut processes)?;
+                    let _ = self.collect_crashes(crash_path);
 
                     // Force full corpus sync between phases so the next engine
                     // sees everything from previous phases.
-                    let _ = self.sync_corpus(None)?;
+                    let _ = self.sync_corpus(None);
+                }
+            }
+            // Switchable strategies: Parallel + all single-engine variants
+            _ => {
+                let mut current = self.strategy;
+                loop {
+                    let (mut processes, engines) = self.spawn_for_strategy(current)?;
+
+                    self.print_launch_info(&crash_dir);
+
+                    let afl_jobs = match current {
+                        Strategy::Parallel => self.allocate_jobs().0,
+                        Strategy::AflOnly => self.jobs,
+                        _ => 0,
+                    };
+                    let abs_corpus = fs::canonicalize(self.corpus_dir())
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| self.corpus_dir());
+                    let abs_external: Vec<String> = self
+                        .external_corpus
+                        .iter()
+                        .map(|p| {
+                            fs::canonicalize(p)
+                                .map(|c| c.display().to_string())
+                                .unwrap_or_else(|_| p.display().to_string())
+                        })
+                        .collect();
+                    let abs_crash = fs::canonicalize(&crash_dir)
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| crash_dir.clone());
+                    let mut dashboard = Dashboard::new(
+                        &self.target,
+                        &self.output_target(),
+                        engines,
+                        self.sync_interval,
+                        true,
+                        Some(current),
+                        afl_jobs,
+                        &abs_corpus,
+                        abs_external,
+                        &abs_crash,
+                    );
+                    dashboard.record_baseline();
+
+                    let (exit, _last_synced) = self.run_phase(
+                        &mut processes,
+                        &mut dashboard,
+                        crash_path,
+                        None,
+                        cmd_rx.as_ref(),
+                        web_html.as_ref(),
+                    )?;
+
+                    match exit {
+                        PhaseExit::Done => {
+                            stop_fuzzers(&mut processes)?;
+                            let _ = self.collect_crashes(crash_path);
+                            break;
+                        }
+                        PhaseExit::SwitchTo(new) => {
+                            stop_fuzzers(&mut processes)?;
+                            let _ = self.collect_crashes(crash_path);
+                            let _ = self.sync_corpus(None);
+                            current = new;
+                        }
+                    }
                 }
             }
         }
@@ -299,27 +423,31 @@ impl Fuzz {
                 eprintln!("    External corpus: {}", dir.display());
             }
         }
-        eprintln!();
-        eprintln!("    Fuzzers are running. Press Enter to open the dashboard...");
     }
 
-    /// Run the main tick loop: crash collection, corpus sync, dashboard refresh,
-    /// liveness check. Returns the last synced creation time.
+    /// Run the main tick loop: crash collection, corpus sync, optional web
+    /// dashboard update, liveness check. Returns the phase exit reason and the
+    /// last synced creation time.
     ///
     /// `phase_duration` of `None` means run forever (parallel mode).
     fn run_phase(
-        &self,
-        processes: &mut [process::Child],
+        &mut self,
+        processes: &mut Vec<Option<ProcessSlot>>,
         dashboard: &mut Dashboard,
         crash_path: &Path,
         phase_duration: Option<Duration>,
-        dashboard_ready: &std::sync::Arc<AtomicBool>,
-    ) -> Result<Option<SystemTime>> {
+        cmd_rx: Option<&mpsc::Receiver<WebCommand>>,
+        web_html: Option<&Arc<Mutex<HashMap<String, String>>>>,
+    ) -> Result<(PhaseExit, Option<SystemTime>)> {
         let mut last_synced_created_time: Option<SystemTime> = None;
         let mut last_sync_time = Instant::now();
         let phase_start = Instant::now();
 
         loop {
+            if STOP.load(Ordering::Relaxed) {
+                break;
+            }
+
             thread::sleep(Duration::from_secs(1));
 
             if STOP.load(Ordering::Relaxed) {
@@ -333,38 +461,90 @@ impl Fuzz {
                 }
             }
 
-            // ── crash collection ────────────────────────────────────────
-            self.collect_crashes(crash_path)?;
+            // Drain web commands, batching rapid-fire scale clicks
+            if let Some(rx) = cmd_rx {
+                let mut afl_delta: i32 = 0;
+                while let Ok(cmd) = rx.try_recv() {
+                    match cmd {
+                        WebCommand::SwitchStrategy(s) => {
+                            return Ok((PhaseExit::SwitchTo(s), last_synced_created_time));
+                        }
+                        WebCommand::ScaleAfl(d) => {
+                            afl_delta += d;
+                        }
+                        WebCommand::PauseSlot(slot) => {
+                            handle_pause_slot(processes, slot);
+                        }
+                        WebCommand::ResumeSlot(slot) => {
+                            handle_resume_slot(processes, slot);
+                        }
+                        WebCommand::RemoveSlot(slot) => {
+                            self.handle_remove_slot(slot, processes, dashboard)?;
+                        }
+                    }
+                }
+                if afl_delta != 0 {
+                    self.handle_scale_afl(afl_delta, processes, dashboard)?;
+                }
+            }
+
+            // ── crash collection (non-fatal during shutdown) ────────────
+            if let Err(e) = self.collect_crashes(crash_path) {
+                if STOP.load(Ordering::Relaxed) {
+                    break;
+                }
+                return Err(e);
+            }
 
             // ── corpus sync (every N minutes) ───────────────────────────
             if last_sync_time.elapsed().as_secs() > self.sync_interval * 60 {
-                if dashboard_ready.load(Ordering::Relaxed) {
-                    dashboard.set_syncing(true);
-                    dashboard.refresh(processes);
+                dashboard.set_syncing(true);
+                if let Some(wh) = web_html {
+                    let (stats, corpus, _) = dashboard.collect_stats(processes);
+                    dashboard.record_tick(&stats, corpus, processes);
+                    let mut map = HashMap::new();
+                    for tab in &["exec", "corpus", "cpu", "mem"] {
+                        map.insert(
+                            tab.to_string(),
+                            dashboard.render_html(&stats, corpus, processes, tab),
+                        );
+                    }
+                    *wh.lock().unwrap() = map;
                 }
-                last_synced_created_time = self.sync_corpus(last_synced_created_time)?;
+                match self.sync_corpus(last_synced_created_time) {
+                    Ok(t) => last_synced_created_time = t,
+                    Err(e) => {
+                        if STOP.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        return Err(e);
+                    }
+                }
                 last_sync_time = Instant::now();
-                if dashboard_ready.load(Ordering::Relaxed) {
-                    dashboard.set_syncing(false);
-                }
+                dashboard.set_syncing(false);
             }
 
-            // ── dashboard refresh + liveness check ──────────────────────
-            if !dashboard_ready.load(Ordering::Relaxed) {
-                let all_dead = processes
-                    .iter_mut()
-                    .all(|p| p.try_wait().unwrap_or(None).is_some());
-                if all_dead {
-                    break;
+            // ── collect stats + update web + liveness check ─────────────
+            let (stats, corpus, all_dead) = dashboard.collect_stats(processes);
+            dashboard.record_tick(&stats, corpus, processes);
+
+            if let Some(wh) = web_html {
+                let mut map = HashMap::new();
+                for tab in &["exec", "corpus", "cpu", "mem"] {
+                    map.insert(
+                        tab.to_string(),
+                        dashboard.render_html(&stats, corpus, processes, tab),
+                    );
                 }
-                continue;
+                *wh.lock().unwrap() = map;
             }
-            if dashboard.refresh(processes) {
+
+            if all_dead {
                 break;
             }
         }
 
-        Ok(last_synced_created_time)
+        Ok((PhaseExit::Done, last_synced_created_time))
     }
 
     /// Return the list of enabled engine kinds (respects --no-* flags).
@@ -385,11 +565,11 @@ impl Fuzz {
 
     /// Spawn a single engine with ALL jobs. Used by sequential mode.
     fn spawn_single_engine(
-        &self,
+        &mut self,
         kind: EngineKind,
         jobs: u32,
-    ) -> Result<(Vec<process::Child>, Vec<EngineInfo>)> {
-        let mut handles = vec![];
+    ) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
+        let mut handles: Vec<Option<ProcessSlot>> = vec![];
         let mut engines = vec![];
         let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
 
@@ -402,6 +582,7 @@ impl Fuzz {
                     name: format!("AFL++ ({jobs}P)"),
                     kind: EngineKind::Afl,
                     process_indices: (start..handles.len()).collect(),
+                    worker_count: jobs,
                 });
                 eprintln!("    Launched AFL++ ({jobs} instances)");
                 for cmd in &afl_cmds {
@@ -415,6 +596,7 @@ impl Fuzz {
                     name: format!("honggfuzz ({jobs}T)"),
                     kind: EngineKind::Honggfuzz,
                     process_indices: (start..handles.len()).collect(),
+                    worker_count: jobs,
                 });
                 eprintln!("    Launched honggfuzz ({jobs} threads)");
                 eprintln!("      $ {hfuzz_cmd}");
@@ -426,6 +608,7 @@ impl Fuzz {
                     name: format!("libfuzzer ({jobs}F)"),
                     kind: EngineKind::Libfuzzer,
                     process_indices: (start..handles.len()).collect(),
+                    worker_count: jobs,
                 });
                 eprintln!("    Launched libfuzzer ({jobs} workers)");
                 eprintln!("      $ {lf_cmd}");
@@ -638,12 +821,12 @@ impl Fuzz {
 
     // ── spawning ────────────────────────────────────────────────────────
 
-    fn spawn_fuzzers(&self) -> Result<(Vec<process::Child>, Vec<EngineInfo>)> {
+    fn spawn_fuzzers(&mut self) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
         if self.no_afl && self.no_honggfuzz && !self.libfuzzer_enabled() {
             return Err(anyhow!("Pick at least one fuzzer"));
         }
 
-        let mut handles = vec![];
+        let mut handles: Vec<Option<ProcessSlot>> = vec![];
         let mut engines = vec![];
         let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
 
@@ -657,6 +840,7 @@ impl Fuzz {
                 name: format!("AFL++ ({afl_jobs}P)"),
                 kind: EngineKind::Afl,
                 process_indices: (start..handles.len()).collect(),
+                worker_count: afl_jobs,
             });
             eprintln!("    Launched AFL++ ({afl_jobs} instances)");
             for cmd in &afl_cmds {
@@ -671,6 +855,7 @@ impl Fuzz {
                 name: format!("honggfuzz ({honggfuzz_jobs}T)"),
                 kind: EngineKind::Honggfuzz,
                 process_indices: (start..handles.len()).collect(),
+                worker_count: honggfuzz_jobs,
             });
             eprintln!("    Launched honggfuzz ({honggfuzz_jobs} threads)");
             eprintln!("      $ {hfuzz_cmd}");
@@ -683,6 +868,7 @@ impl Fuzz {
                 name: format!("libfuzzer ({libfuzzer_jobs}F)"),
                 kind: EngineKind::Libfuzzer,
                 process_indices: (start..handles.len()).collect(),
+                worker_count: libfuzzer_jobs,
             });
             eprintln!("    Launched libfuzzer ({libfuzzer_jobs} workers)");
             eprintln!("      $ {lf_cmd}");
@@ -755,21 +941,31 @@ impl Fuzz {
         (a, h, lf_jobs)
     }
 
-    fn spawn_afl(
-        &self,
-        cargo: &str,
-        afl_jobs: u32,
-        handles: &mut Vec<process::Child>,
-    ) -> Result<Vec<String>> {
-        // Power schedule diversity following AFL++ best practices
-        let afl_modes = [
-            "explore", "fast", "coe", "lin", "quad", "exploit", "rare", "explore", "fast", "mmopt",
-        ];
-
+    /// Compute the AFL++ input directory (resume-aware).
+    fn afl_input_dir(&self) -> Result<String> {
         let corpus = self.corpus_dir();
+        let afl_queue_dir = format!("{}/afl/mainaflfuzzer/queue", self.output_target());
+        let afl_can_resume = Path::new(&afl_queue_dir)
+            .read_dir()
+            .map(|mut d| d.next().is_some())
+            .unwrap_or(false);
 
-        // AFL++ supports up to 4 -x flags natively; merge if more.
-        let dict_flags: Vec<String> = if self.dictionaries.is_empty() {
+        if afl_can_resume {
+            let minimal = format!("{}/afl/_seed", self.output_target());
+            fs::create_dir_all(&minimal)?;
+            let marker = format!("{minimal}/init");
+            if !Path::new(&marker).exists() {
+                File::create(&marker)?.write_all(b"00000000\n")?;
+            }
+            Ok(minimal)
+        } else {
+            Ok(corpus)
+        }
+    }
+
+    /// AFL++ dictionary flags (shared by main and secondaries).
+    fn afl_dict_flags(&self) -> Vec<String> {
+        if self.dictionaries.is_empty() {
             vec![]
         } else if self.dictionaries.len() <= 4 {
             self.dictionaries
@@ -779,95 +975,131 @@ impl Fuzz {
         } else {
             let merged = self.merged_dict.as_ref().unwrap();
             vec![format!("-x{}", merged.display())]
+        }
+    }
+
+    /// Spawn a single AFL++ secondary instance.
+    fn spawn_afl_secondary(&self, cargo: &str, job_num: u32) -> Result<process::Child> {
+        let afl_modes = [
+            "explore", "fast", "coe", "lin", "quad", "exploit", "rare", "explore", "fast", "mmopt",
+        ];
+
+        let afl_input_dir = self.afl_input_dir()?;
+        let dict_flags = self.afl_dict_flags();
+
+        let fuzzer_name = format!("-Ssecondaryfuzzer{job_num}");
+        let mopt = if job_num % 10 == 9 { "-L0" } else { "" };
+        let power_schedule = afl_modes
+            .get(job_num as usize % afl_modes.len())
+            .unwrap_or(&"fast");
+        let old_queue = if job_num % 10 == 8 { "-Z" } else { "" };
+
+        let target_path_str = format!("./target/afl/debug/{}", self.target);
+        let cmplog_flags: Vec<String> = match job_num {
+            1 => vec![format!("-c{target_path_str}"), "-l2a".to_string()],
+            3 => vec![format!("-c{target_path_str}"), "-l1".to_string()],
+            14 => vec![format!("-c{target_path_str}"), "-l2a".to_string()],
+            22 => vec![format!("-c{target_path_str}"), "-l3at".to_string()],
+            _ => vec![],
         };
 
-        // When AFL++ already has a queue from a previous run, use a minimal
-        // seed directory instead of the (potentially huge) shared corpus.
-        // AFL_AUTORESUME makes AFL++ reuse its existing queue, so `-i` only
-        // matters for the very first import — a single dummy seed is enough.
-        let afl_queue_dir = format!("{}/afl/mainaflfuzzer/queue", self.output_target());
-        let afl_can_resume = Path::new(&afl_queue_dir)
-            .read_dir()
-            .map(|mut d| d.next().is_some())
-            .unwrap_or(false);
-
-        let afl_input_dir = if afl_can_resume {
-            let minimal = format!("{}/afl/_seed", self.output_target());
-            fs::create_dir_all(&minimal)?;
-            let marker = format!("{minimal}/init");
-            if !Path::new(&marker).exists() {
-                File::create(&marker)?.write_all(b"00000000\n")?;
-            }
-            minimal
-        } else {
-            corpus.clone()
+        let timeout_flag = match self.timeout {
+            Some(t) => format!("-t{}", t * 1000),
+            None => String::new(),
         };
+        let max_len_flag = format!("-G{}", self.max_input_size);
+
+        let log_name = format!("afl_{job_num}.log");
+        let log_destination = || -> Stdio {
+            File::create(format!("{}/logs/{log_name}", self.output_target()))
+                .unwrap()
+                .into()
+        };
+
+        let target_path = format!("./target/afl/debug/{}", self.target);
+
+        let afl_args: Vec<String> = [
+            "afl".to_string(),
+            "fuzz".to_string(),
+            fuzzer_name,
+            format!("-i{afl_input_dir}"),
+            format!("-p{power_schedule}"),
+            format!("-o{}/afl", self.output_target()),
+            old_queue.to_string(),
+            mopt.to_string(),
+            timeout_flag,
+            max_len_flag,
+        ]
+        .into_iter()
+        .filter(|a| !a.is_empty())
+        .chain(cmplog_flags.iter().cloned())
+        .collect();
+
+        let child = process::Command::new(cargo)
+            .args(&afl_args)
+            .args(&dict_flags)
+            .arg(&target_path)
+            .env("AFL_AUTORESUME", "1")
+            .env("AFL_TESTCACHE_SIZE", "100")
+            .env("AFL_FAST_CAL", "1")
+            .env("AFL_FORCE_UI", "1")
+            .env("AFL_IGNORE_UNKNOWN_ENVS", "1")
+            .env("AFL_CMPLOG_ONLY_NEW", "1")
+            .env("AFL_DISABLE_TRIM", "1")
+            .env("AFL_NO_WARN_INSTABILITY", "1")
+            .env("AFL_FUZZER_STATS_UPDATE_INTERVAL", "10")
+            .env("_DUMMY_VAR", "1")
+            .env("AFL_IGNORE_SEED_PROBLEMS", "1")
+            .stdout(log_destination())
+            .stderr(log_destination())
+            .process_group(0)
+            .spawn()?;
+
+        Ok(child)
+    }
+
+    fn spawn_afl(
+        &mut self,
+        cargo: &str,
+        afl_jobs: u32,
+        handles: &mut Vec<Option<ProcessSlot>>,
+    ) -> Result<Vec<String>> {
+        let afl_modes = [
+            "explore", "fast", "coe", "lin", "quad", "exploit", "rare", "explore", "fast", "mmopt",
+        ];
+
+        let afl_input_dir = self.afl_input_dir()?;
+        let dict_flags = self.afl_dict_flags();
 
         let mut cmds = Vec::new();
 
-        for job_num in 0..afl_jobs {
-            let is_main = job_num == 0;
+        // Spawn main instance (job_num=0) — unique -M flag, -F sync flags, AFL_FINAL_SYNC
+        {
+            let job_num: u32 = 0;
+            let fuzzer_name = String::from("-Mmainaflfuzzer");
 
-            let fuzzer_name = if is_main {
-                String::from("-Mmainaflfuzzer")
-            } else {
-                format!("-Ssecondaryfuzzer{job_num}")
-            };
-
-            // Only the main instance syncs from honggfuzz's output corpus
-            let honggfuzz_sync_flag = if self.honggfuzz_enabled() && job_num == 0 {
+            let honggfuzz_sync_flag = if self.honggfuzz_enabled() {
                 format!("-F{}/honggfuzz/corpus", self.output_target())
             } else {
                 String::new()
             };
-
-            let libfuzzer_sync_flag = if self.libfuzzer_enabled() && job_num == 0 {
+            let libfuzzer_sync_flag = if self.libfuzzer_enabled() {
                 format!("-F{}/libfuzzer/corpus", self.output_target())
             } else {
                 String::new()
             };
 
-            // 10% MOpt mutator
-            let mopt = if job_num % 10 == 9 { "-L0" } else { "" };
-
-            let power_schedule = afl_modes
-                .get(job_num as usize % afl_modes.len())
-                .unwrap_or(&"fast");
-
-            // 10% old queue cycling
-            let old_queue = if job_num % 10 == 8 { "-Z" } else { "" };
-
-            // Cmplog diversity
-            let cmplog = match job_num {
-                1 => "-l2a",
-                3 => "-l1",
-                14 => "-l2a",
-                22 => "-l3at",
-                _ => "-c-",
-            };
-
+            let power_schedule = afl_modes[0];
             let timeout_flag = match self.timeout {
                 Some(t) => format!("-t{}", t * 1000),
                 None => String::new(),
             };
-
             let max_len_flag = format!("-G{}", self.max_input_size);
 
             let log_destination = || -> Stdio {
-                let name = if job_num == 0 {
-                    "afl.log".to_string()
-                } else {
-                    format!("afl_{job_num}.log")
-                };
-                File::create(format!("{}/logs/{name}", self.output_target()))
+                File::create(format!("{}/logs/afl.log", self.output_target()))
                     .unwrap()
                     .into()
-            };
-
-            let final_sync = if job_num == 0 {
-                "AFL_FINAL_SYNC"
-            } else {
-                "_DUMMY_VAR"
             };
 
             let target_path = format!("./target/afl/debug/{}", self.target);
@@ -881,9 +1113,6 @@ impl Fuzz {
                 format!("-o{}/afl", self.output_target()),
                 honggfuzz_sync_flag.clone(),
                 libfuzzer_sync_flag.clone(),
-                old_queue.to_string(),
-                cmplog.to_string(),
-                mopt.to_string(),
                 timeout_flag.clone(),
                 max_len_flag.clone(),
             ]
@@ -892,17 +1121,18 @@ impl Fuzz {
             .collect();
 
             let mut cmd_parts: Vec<String> = Vec::new();
-            cmd_parts.push(format!(
-                "AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1 {final_sync}=1"
-            ));
+            cmd_parts.push(
+                "AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1 AFL_FINAL_SYNC=1"
+                    .to_string(),
+            );
             cmd_parts.push(cargo.to_string());
             cmd_parts.extend(afl_args.iter().cloned());
             cmd_parts.extend(dict_flags.iter().cloned());
             cmd_parts.push(target_path.clone());
             cmds.push(cmd_parts.join(" "));
 
-            handles.push(
-                process::Command::new(cargo)
+            handles.push(Some(ProcessSlot {
+                child: process::Command::new(cargo)
                     .args(&afl_args)
                     .args(&dict_flags)
                     .arg(&target_path)
@@ -915,14 +1145,76 @@ impl Fuzz {
                     .env("AFL_DISABLE_TRIM", "1")
                     .env("AFL_NO_WARN_INSTABILITY", "1")
                     .env("AFL_FUZZER_STATS_UPDATE_INTERVAL", "10")
-                    .env(final_sync, "1")
+                    .env("AFL_FINAL_SYNC", "1")
                     .env("AFL_IGNORE_SEED_PROBLEMS", "1")
                     .stdout(log_destination())
                     .stderr(log_destination())
                     .process_group(0)
                     .spawn()?,
-            );
+                paused: false,
+                job_num: Some(0),
+            }));
+
+            let _ = job_num; // suppress unused warning
         }
+
+        // Spawn secondaries (job_num 1..afl_jobs)
+        for job_num in 1..afl_jobs {
+            let child = self.spawn_afl_secondary(cargo, job_num)?;
+
+            // Build command string for logging
+            let fuzzer_name = format!("-Ssecondaryfuzzer{job_num}");
+            let power_schedule = afl_modes
+                .get(job_num as usize % afl_modes.len())
+                .unwrap_or(&"fast");
+            let timeout_flag = match self.timeout {
+                Some(t) => format!("-t{}", t * 1000),
+                None => String::new(),
+            };
+            let max_len_flag = format!("-G{}", self.max_input_size);
+            let mopt = if job_num % 10 == 9 { "-L0" } else { "" };
+            let old_queue = if job_num % 10 == 8 { "-Z" } else { "" };
+            let target_path = format!("./target/afl/debug/{}", self.target);
+            let target_path_str = format!("./target/afl/debug/{}", self.target);
+            let cmplog_flags: Vec<String> = match job_num {
+                1 => vec![format!("-c{target_path_str}"), "-l2a".to_string()],
+                3 => vec![format!("-c{target_path_str}"), "-l1".to_string()],
+                14 => vec![format!("-c{target_path_str}"), "-l2a".to_string()],
+                22 => vec![format!("-c{target_path_str}"), "-l3at".to_string()],
+                _ => vec![],
+            };
+
+            let mut cmd_parts: Vec<String> = Vec::new();
+            cmd_parts.push("AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1".to_string());
+            cmd_parts.push(cargo.to_string());
+            cmd_parts.push("afl fuzz".to_string());
+            cmd_parts.push(fuzzer_name);
+            cmd_parts.push(format!("-i{afl_input_dir}"));
+            cmd_parts.push(format!("-p{power_schedule}"));
+            cmd_parts.push(format!("-o{}/afl", self.output_target()));
+            if !old_queue.is_empty() {
+                cmd_parts.push(old_queue.to_string());
+            }
+            if !mopt.is_empty() {
+                cmd_parts.push(mopt.to_string());
+            }
+            if !timeout_flag.is_empty() {
+                cmd_parts.push(timeout_flag);
+            }
+            cmd_parts.push(max_len_flag);
+            cmd_parts.extend(cmplog_flags);
+            cmd_parts.extend(dict_flags.iter().cloned());
+            cmd_parts.push(target_path);
+            cmds.push(cmd_parts.join(" "));
+
+            handles.push(Some(ProcessSlot {
+                child,
+                paused: false,
+                job_num: Some(job_num),
+            }));
+        }
+
+        self.next_afl_job_num = afl_jobs;
 
         Ok(cmds)
     }
@@ -931,7 +1223,7 @@ impl Fuzz {
         &self,
         cargo: &str,
         honggfuzz_jobs: u32,
-        handles: &mut Vec<process::Child>,
+        handles: &mut Vec<Option<ProcessSlot>>,
     ) -> Result<String> {
         let corpus = self.corpus_dir();
 
@@ -947,55 +1239,6 @@ impl Fuzz {
         } else {
             format!("-w{}", self.merged_dict.as_ref().unwrap().display())
         };
-
-        // Purge any corpus/queue files exceeding max_input_size so honggfuzz
-        // doesn't abort on oversized inputs left by other engines.
-        let max_len = self.max_input_size as u64;
-        let mut oversized: Vec<PathBuf> = Vec::new();
-        for dir in [
-            format!("{}/queue", self.output_target()),
-            format!("{}/honggfuzz/corpus", self.output_target()),
-        ] {
-            if let Ok(entries) = fs::read_dir(&dir) {
-                for entry in entries.flatten() {
-                    if entry.metadata().map(|m| m.len()).unwrap_or(0) > max_len {
-                        oversized.push(entry.path());
-                    }
-                }
-            }
-        }
-        if !oversized.is_empty() {
-            eprintln!(
-                "    Warning: {} file(s) exceed max_input_size ({} bytes) and will crash honggfuzz.",
-                oversized.len(),
-                self.max_input_size,
-            );
-            // Group by parent directory for a concise summary.
-            let mut by_dir: std::collections::HashMap<String, usize> =
-                std::collections::HashMap::new();
-            for path in &oversized {
-                let dir = path
-                    .parent()
-                    .map(|p| p.display().to_string())
-                    .unwrap_or_default();
-                *by_dir.entry(dir).or_default() += 1;
-            }
-            for (dir, count) in &by_dir {
-                eprintln!("      {count} file(s) in {dir}");
-            }
-            eprint!("    Remove them? [Y/n] ");
-            let mut answer = String::new();
-            std::io::stdin().read_line(&mut answer)?;
-            let answer = answer.trim().to_lowercase();
-            if answer.is_empty() || answer == "y" || answer == "yes" {
-                for path in &oversized {
-                    let _ = fs::remove_file(path);
-                }
-                eprintln!("    Removed {} oversized file(s).", oversized.len());
-            } else {
-                eprintln!("    Skipped removal. Honggfuzz may abort on oversized inputs.");
-            }
-        }
 
         // The `script` invocation is a trick to get the correct TTY output for
         // honggfuzz (it requires a valid terminal).
@@ -1023,8 +1266,8 @@ impl Fuzz {
 
         let hfuzz_log = File::create(format!("{}/logs/honggfuzz.log", self.output_target()))?;
         let hfuzz_log_clone = hfuzz_log.try_clone()?;
-        handles.push(
-            process::Command::new("script")
+        handles.push(Some(ProcessSlot {
+            child: process::Command::new("script")
                 .args([
                     "--flush",
                     "--quiet",
@@ -1044,7 +1287,9 @@ impl Fuzz {
                 .stdout(hfuzz_log_clone)
                 .process_group(0)
                 .spawn()?,
-        );
+            paused: false,
+            job_num: None,
+        }));
 
         Ok(cmd_str)
     }
@@ -1052,7 +1297,7 @@ impl Fuzz {
     fn spawn_libfuzzer(
         &self,
         libfuzzer_jobs: u32,
-        handles: &mut Vec<process::Child>,
+        handles: &mut Vec<Option<ProcessSlot>>,
     ) -> Result<String> {
         // The libfuzzer binary is built with --target=<triple> to isolate
         // SanitizerCoverage flags from build scripts.
@@ -1093,17 +1338,179 @@ impl Fuzz {
         let lf_log = File::create(format!("{}/logs/libfuzzer.log", self.output_target()))?;
         let lf_log_clone = lf_log.try_clone()?;
 
-        handles.push(
-            process::Command::new(&binary)
+        handles.push(Some(ProcessSlot {
+            child: process::Command::new(&binary)
                 .args(&args)
                 .stdout(lf_log)
                 .stderr(lf_log_clone)
                 .process_group(0)
                 .spawn()
                 .with_context(|| format!("Failed to spawn libfuzzer binary: {binary}"))?,
-        );
+            paused: false,
+            job_num: None,
+        }));
 
         Ok(cmd_str)
+    }
+
+    /// Spawn fuzzers for a given (switchable) strategy.
+    fn spawn_for_strategy(
+        &mut self,
+        s: Strategy,
+    ) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
+        match s {
+            Strategy::Parallel => self.spawn_fuzzers(),
+            Strategy::AflOnly => self.spawn_single_engine(EngineKind::Afl, self.jobs),
+            Strategy::HonggOnly => self.spawn_single_engine(EngineKind::Honggfuzz, self.jobs),
+            Strategy::LibfuzzerOnly => self.spawn_single_engine(EngineKind::Libfuzzer, self.jobs),
+            Strategy::Sequential => unreachable!(),
+        }
+    }
+
+    /// Dynamically add or remove AFL++ secondary workers.
+    fn handle_scale_afl(
+        &mut self,
+        delta: i32,
+        processes: &mut Vec<Option<ProcessSlot>>,
+        dashboard: &mut Dashboard,
+    ) -> Result<()> {
+        // Find the AFL engine in the dashboard
+        let afl_idx = dashboard
+            .engines
+            .iter()
+            .position(|e| matches!(e.kind, EngineKind::Afl));
+        let Some(afl_idx) = afl_idx else {
+            return Ok(()); // AFL not active
+        };
+
+        let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
+
+        if delta > 0 {
+            // Scale up
+            for _ in 0..delta {
+                let job_num = self.next_afl_job_num;
+                let child = self.spawn_afl_secondary(&cargo, job_num)?;
+                let slot_idx = processes.len();
+                processes.push(Some(ProcessSlot {
+                    child,
+                    paused: false,
+                    job_num: Some(job_num),
+                }));
+                dashboard.engines[afl_idx].process_indices.push(slot_idx);
+                dashboard.engines[afl_idx].worker_count += 1;
+                self.next_afl_job_num += 1;
+                dashboard.afl_job_count += 1;
+            }
+        } else {
+            // Scale down
+            let remove_count = (-delta) as usize;
+            for _ in 0..remove_count {
+                let engine = &mut dashboard.engines[afl_idx];
+                // Never kill the main instance (always at index 0 in process_indices)
+                if engine.process_indices.len() <= 1 {
+                    break;
+                }
+                let slot_idx = engine.process_indices.pop().unwrap();
+                if let Some(ps) = processes[slot_idx].as_ref() {
+                    if ps.paused {
+                        send_signal_to_process_group(ps.child.id(), libc::SIGCONT);
+                    }
+                    let _ = kill_process_tree(ps.child.id());
+                }
+                processes[slot_idx] = None;
+                engine.worker_count -= 1;
+                dashboard.afl_job_count -= 1;
+            }
+        }
+
+        // Update the engine display name
+        let wc = dashboard.engines[afl_idx].worker_count;
+        dashboard.engines[afl_idx].name = format!("AFL++ ({wc}P)");
+
+        Ok(())
+    }
+
+    /// Remove a specific process slot (used by the web UI remove button).
+    fn handle_remove_slot(
+        &mut self,
+        slot: usize,
+        processes: &mut [Option<ProcessSlot>],
+        dashboard: &mut Dashboard,
+    ) -> Result<()> {
+        for engine in &mut dashboard.engines {
+            if let Some(pos) = engine.process_indices.iter().position(|&idx| idx == slot) {
+                // For AFL, don't allow removing the main instance (position 0)
+                if matches!(engine.kind, EngineKind::Afl) && pos == 0 {
+                    return Ok(());
+                }
+                if let Some(ps) = processes[slot].take() {
+                    if ps.paused {
+                        send_signal_to_process_group(ps.child.id(), libc::SIGCONT);
+                    }
+                    let _ = kill_process_tree(ps.child.id());
+                }
+                engine.process_indices.remove(pos);
+                engine.worker_count -= 1;
+                if matches!(engine.kind, EngineKind::Afl) {
+                    dashboard.afl_job_count -= 1;
+                    let wc = engine.worker_count;
+                    engine.name = format!("AFL++ ({wc}P)");
+                }
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Check for oversized files that would crash honggfuzz and prompt for removal.
+    /// Must be called BEFORE the stdin command thread is spawned.
+    fn check_honggfuzz_oversized_files(&self) -> Result<()> {
+        let max_len = self.max_input_size as u64;
+        let mut oversized: Vec<PathBuf> = Vec::new();
+        for dir in [
+            format!("{}/queue", self.output_target()),
+            format!("{}/honggfuzz/corpus", self.output_target()),
+        ] {
+            if let Ok(entries) = fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if entry.metadata().map(|m| m.len()).unwrap_or(0) > max_len {
+                        oversized.push(entry.path());
+                    }
+                }
+            }
+        }
+        if !oversized.is_empty() {
+            eprintln!(
+                "    Warning: {} file(s) exceed max_input_size ({} bytes) and will crash honggfuzz.",
+                oversized.len(),
+                self.max_input_size,
+            );
+            let mut by_dir: std::collections::HashMap<String, usize> =
+                std::collections::HashMap::new();
+            for path in &oversized {
+                let dir = path
+                    .parent()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_default();
+                *by_dir.entry(dir).or_default() += 1;
+            }
+            for (dir, count) in &by_dir {
+                eprintln!("      {count} file(s) in {dir}");
+            }
+            eprint!("    Remove them? [Y/n] ");
+            let mut answer = String::new();
+            std::io::stdin().read_line(&mut answer)?;
+            let answer = answer.trim().to_lowercase();
+            if answer.is_empty() || answer == "y" || answer == "yes" {
+                for path in &oversized {
+                    let _ = fs::remove_file(path);
+                }
+                eprintln!("    Removed {} oversized file(s).", oversized.len());
+            } else {
+                eprintln!("    Skipped removal. Honggfuzz may abort on oversized inputs.");
+            }
+        }
+        Ok(())
     }
 }
 
@@ -1156,9 +1563,39 @@ fn kill_subprocesses_recursively(pid: &str) -> Result<()> {
     Ok(())
 }
 
-fn stop_fuzzers(processes: &mut Vec<process::Child>) -> Result<()> {
-    for process in processes {
-        kill_process_tree(process.id())?;
+/// Send a signal to an entire process group.
+fn send_signal_to_process_group(pid: u32, signal: libc::c_int) {
+    unsafe {
+        libc::kill(-(pid as i32), signal);
+    }
+}
+
+fn handle_pause_slot(processes: &mut [Option<ProcessSlot>], slot: usize) {
+    if let Some(ps) = processes.get_mut(slot).and_then(|o| o.as_mut()) {
+        if !ps.paused {
+            send_signal_to_process_group(ps.child.id(), libc::SIGSTOP);
+            ps.paused = true;
+        }
+    }
+}
+
+fn handle_resume_slot(processes: &mut [Option<ProcessSlot>], slot: usize) {
+    if let Some(ps) = processes.get_mut(slot).and_then(|o| o.as_mut()) {
+        if ps.paused {
+            send_signal_to_process_group(ps.child.id(), libc::SIGCONT);
+            ps.paused = false;
+        }
+    }
+}
+
+fn stop_fuzzers(processes: &mut [Option<ProcessSlot>]) -> Result<()> {
+    for slot in processes.iter_mut() {
+        if let Some(ps) = slot.take() {
+            if ps.paused {
+                send_signal_to_process_group(ps.child.id(), libc::SIGCONT);
+            }
+            kill_process_tree(ps.child.id())?;
+        }
     }
     Ok(())
 }

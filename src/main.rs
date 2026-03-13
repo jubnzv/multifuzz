@@ -2,16 +2,23 @@ mod build;
 mod fuzz;
 mod run;
 mod ui;
+mod web;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
-#[derive(Clone, Copy, Default, clap::ValueEnum)]
+#[derive(Clone, Copy, Default, PartialEq, clap::ValueEnum)]
 pub enum Strategy {
     #[default]
     Parallel,
     Sequential,
+    #[clap(name = "afl-only")]
+    AflOnly,
+    #[clap(name = "hongg-only")]
+    HonggOnly,
+    #[clap(name = "libfuzzer-only")]
+    LibfuzzerOnly,
 }
 
 pub const DEFAULT_OUTPUT_DIR: &str = "./output";
@@ -70,6 +77,9 @@ pub struct Fuzz {
     dictionaries: Vec<PathBuf>,
     #[clap(skip)]
     merged_dict: Option<PathBuf>,
+    /// Monotonically increasing AFL job counter (avoids output dir collisions on scale).
+    #[clap(skip)]
+    next_afl_job_num: u32,
     /// Timeout for a single run in seconds
     #[clap(short, long, value_name = "SECS")]
     timeout: Option<u32>,
@@ -104,6 +114,12 @@ pub struct Fuzz {
     /// Total session duration in minutes (required with --strategy sequential)
     #[clap(long = "duration", value_name = "MINS")]
     duration: Option<u64>,
+    /// Enable web dashboard (auto-refreshing HTML page)
+    #[clap(long = "web", action)]
+    web: bool,
+    /// Port for the web dashboard
+    #[clap(long = "web-port", value_name = "PORT", default_value_t = 8080)]
+    web_port: u16,
 }
 
 #[derive(clap::Args)]
