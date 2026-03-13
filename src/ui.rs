@@ -22,6 +22,8 @@ pub struct ProcessSlot {
     pub paused: bool,
     /// AFL job_num (for display label), None for honggfuzz/libfuzzer.
     pub job_num: Option<u32>,
+    /// Command string used to spawn this process (shown as tooltip).
+    pub command: Option<String>,
 }
 
 pub struct EngineInfo {
@@ -61,11 +63,6 @@ struct TimeSeriesSample {
     per_engine: Vec<f64>,
 }
 
-struct ScalarSample {
-    elapsed_secs: f64,
-    value: f64,
-}
-
 struct SyncPeriod {
     start_secs: f64,
     end_secs: Option<f64>,
@@ -95,7 +92,7 @@ pub struct Dashboard {
 
     // Time-series ring buffers
     exec_history: VecDeque<TimeSeriesSample>,
-    corpus_history: VecDeque<ScalarSample>,
+    corpus_history: VecDeque<TimeSeriesSample>,
     cpu_history: VecDeque<TimeSeriesSample>,
     mem_history: VecDeque<TimeSeriesSample>,
 
@@ -117,6 +114,9 @@ pub struct Dashboard {
 
     /// Sync period annotations rendered as shaded bands on graphs.
     sync_periods: Vec<SyncPeriod>,
+
+    /// Unix epoch when this session started, used to detect stale fuzzer_stats.
+    session_start_epoch: u64,
 }
 
 // ── dashboard ────────────────────────────────────────────────────────────
@@ -163,6 +163,10 @@ impl Dashboard {
             clock_ticks_per_sec,
             page_size,
             sync_periods: Vec::new(),
+            session_start_epoch: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
         }
     }
 
@@ -211,7 +215,7 @@ impl Dashboard {
 
     /// Record one tick of time-series data for graphs.
     /// AFL++ workers are expanded into individual graph lines.
-    pub fn record_tick(&mut self, corpus_count: u64, processes: &[Option<ProcessSlot>]) {
+    pub fn record_tick(&mut self, _corpus_count: u64, processes: &[Option<ProcessSlot>]) {
         let elapsed_secs = self.start_time.elapsed().as_secs_f64();
         let dt = elapsed_secs - self.prev_tick_secs;
         let first_tick = self.prev_tick_secs == 0.0;
@@ -219,6 +223,7 @@ impl Dashboard {
 
         // Build per-graph-line values: expand AFL workers individually.
         let mut exec_values = Vec::new();
+        let mut corpus_values = Vec::new();
         let mut cpu_values = Vec::new();
         let mut mem_values = Vec::new();
         let mut labels = Vec::new();
@@ -260,12 +265,10 @@ impl Dashboard {
                             format!("AFL++ w{wi}")
                         };
 
-                        // Exec/s from fuzzer_stats
-                        let exec_s = job_num
-                            .and_then(|jn| afl_worker_stats.get(&jn))
-                            .map(|ws| ws.execs_per_sec)
-                            .unwrap_or(0.0);
-                        exec_values.push(exec_s);
+                        // Exec/s and corpus from fuzzer_stats
+                        let ws = job_num.and_then(|jn| afl_worker_stats.get(&jn));
+                        exec_values.push(ws.map(|w| w.execs_per_sec).unwrap_or(0.0));
+                        corpus_values.push(ws.map(|w| w.corpus_count as f64).unwrap_or(0.0));
 
                         // CPU & memory from /proc
                         if let Some(ps) = ps {
@@ -319,11 +322,20 @@ impl Dashboard {
                     };
                     self.prev_cpu_jiffies.insert(synth_key, total_jiffies);
 
-                    exec_values.push(match engine.kind {
-                        EngineKind::Honggfuzz => self.read_honggfuzz_stats().execs_per_sec,
-                        EngineKind::Libfuzzer => self.read_libfuzzer_stats().execs_per_sec,
-                        _ => 0.0,
-                    });
+                    let engine_stats = match engine.kind {
+                        EngineKind::Honggfuzz => self.read_honggfuzz_stats(),
+                        EngineKind::Libfuzzer => self.read_libfuzzer_stats(),
+                        _ => EngineStats {
+                            execs_per_sec: 0.0,
+                            corpus_count: 0,
+                            crashes: 0,
+                            alive: false,
+                            loading: false,
+                            status_hint: None,
+                        },
+                    };
+                    exec_values.push(engine_stats.execs_per_sec);
+                    corpus_values.push(engine_stats.corpus_count as f64);
                     cpu_values.push(cpu_pct);
                     mem_values.push(total_rss as f64 / (1024.0 * 1024.0));
 
@@ -344,9 +356,9 @@ impl Dashboard {
             elapsed_secs,
             per_engine: exec_values,
         });
-        self.corpus_history.push_back(ScalarSample {
+        self.corpus_history.push_back(TimeSeriesSample {
             elapsed_secs,
-            value: corpus_count as f64,
+            per_engine: corpus_values,
         });
         self.cpu_history.push_back(TimeSeriesSample {
             elapsed_secs,
@@ -360,15 +372,13 @@ impl Dashboard {
         // Evict old samples
         for buf in [
             &mut self.exec_history,
+            &mut self.corpus_history,
             &mut self.cpu_history,
             &mut self.mem_history,
         ] {
             while buf.len() > GRAPH_MAX_SAMPLES {
                 buf.pop_front();
             }
-        }
-        while self.corpus_history.len() > GRAPH_MAX_SAMPLES {
-            self.corpus_history.pop_front();
         }
     }
 
@@ -458,7 +468,6 @@ impl Dashboard {
             r#"<!DOCTYPE html>
 <html><head>
 <meta charset="utf-8">
-<meta http-equiv="refresh" content="2;url=/?tab={active_tab}">
 <title>multifuzz — {target_escaped}</title>
 <style>
 body {{ font-family: monospace; background: #1a1a2e; color: #e0e0e0; padding: 20px; }}
@@ -483,6 +492,7 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
 .action-btn:hover {{ background: #1a3a5c; }}
 .action-btn.danger {{ border-color: #f44336; }}
 .action-btn.danger:hover {{ background: #5c1a1a; }}
+td[title] {{ cursor: help; border-bottom: 1px dotted #555; }}
 .path-copy {{ cursor:pointer; border-bottom: 1px dotted #888; }}
 .path-copy:hover {{ color: #00d4ff; }}
 .tab-bar {{ margin: 10px 0; }}
@@ -496,20 +506,25 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
 
         let header = format!("multifuzz &mdash; {target_escaped}");
         let _ = writeln!(buf, "<h1>{header}</h1>");
-        let _ = writeln!(buf, "<p>Runtime: {}</p>", fmt_duration(elapsed));
+        let _ = writeln!(
+            buf,
+            "<p id=\"runtime\">Runtime: {}</p>",
+            fmt_duration(elapsed)
+        );
 
         let last_sync_str = self.last_sync.as_deref().unwrap_or("&mdash;");
         let _ = writeln!(
             buf,
-            "<p>Last sync: {last_sync_str} (every {} min)</p>",
+            "<p id=\"last-sync\">Last sync: {last_sync_str} (every {} min)</p>",
             self.sync_interval
         );
         let corpus_dir = &self.corpus_dir;
         let _ = writeln!(
             buf,
-            "<p><span class=\"path-copy\" title=\"{corpus_dir}\" \
+            "<p id=\"corpus-count\"><span class=\"path-copy\" title=\"{corpus_dir}\" \
              onclick=\"navigator.clipboard.writeText('{corpus_dir}')\">Corpus:</span> {corpus_count} files (shared)</p>"
         );
+        let _ = write!(buf, "<div id=\"external-corpus\">");
         for ext_dir in &self.external_corpus {
             let ext_count = count_files(ext_dir);
             let _ = writeln!(
@@ -518,19 +533,25 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
                  onclick=\"navigator.clipboard.writeText('{ext_dir}')\">External:</span> {ext_dir} ({ext_count} files)</p>"
             );
         }
+        let _ = write!(buf, "</div>");
         let crash_dir = &self.crash_dir;
         let _ = writeln!(
             buf,
-            "<p><span class=\"path-copy\" title=\"{crash_dir}\" \
+            "<p id=\"crash-count\"><span class=\"path-copy\" title=\"{crash_dir}\" \
              onclick=\"navigator.clipboard.writeText('{crash_dir}')\">Crashes:</span> {total_crashes}</p>"
         );
         if self.syncing {
-            let _ = writeln!(buf, "<p class=\"syncing\">syncing corpus...</p>");
+            let _ = writeln!(
+                buf,
+                "<p id=\"syncing\" class=\"syncing\">syncing corpus...</p>"
+            );
+        } else {
+            let _ = writeln!(buf, "<p id=\"syncing\"></p>");
         }
 
         let _ = writeln!(
             buf,
-            "<table><tr><th>Engine</th><th>Status</th><th>Exec/s</th><th>Corpus</th><th>Crashes</th><th>Actions</th></tr>"
+            "<table id=\"stats-table\"><tr><th>Engine</th><th>Status</th><th>Exec/s</th><th>Corpus</th><th>Crashes</th><th>Actions</th></tr>"
         );
         for (ei, es) in stats.iter().enumerate() {
             let engine = &self.engines[ei];
@@ -551,10 +572,15 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
             };
 
             if matches!(engine.kind, EngineKind::Afl) {
-                // AFL header row with aggregate stats
+                // AFL header row — per-worker statuses shown in sub-rows
+                let afl_header_actions = if self.show_switch_hints {
+                    &format!("<a class=\"action-btn\" href=\"/scale?e=afl&amp;d=1&amp;tab={active_tab}\" title=\"add AFL++ worker\">+</a>")
+                } else {
+                    ""
+                };
                 let _ = writeln!(
                     buf,
-                    "<tr><td><b>AFL++</b></td><td>{status}</td><td></td><td></td><td></td><td></td></tr>",
+                    "<tr><td><b>AFL++</b></td><td></td><td></td><td></td><td></td><td>{afl_header_actions}</td></tr>",
                 );
 
                 // Per-worker sub-rows (only in switchable mode)
@@ -572,12 +598,21 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
                             (format!("worker #{pos}"), None)
                         };
 
+                        let worker_stats = job_num.and_then(|jn| afl_worker_stats.get(&jn));
+                        let worker_loading = worker_stats.map(|ws| ws.loading).unwrap_or(true); // no stats yet → loading
+                        let worker_hint = worker_stats.and_then(|ws| ws.status_hint.as_deref());
                         let (worker_status, is_paused) = match processes.get(slot_idx) {
                             Some(Some(ps)) if ps.paused => {
-                                ("<span class=\"paused\">paused</span>", true)
+                                ("<span class=\"paused\">paused</span>".to_string(), true)
                             }
-                            Some(Some(_)) => ("<span class=\"alive\">alive</span>", false),
-                            _ => ("<span class=\"dead\">dead</span>", false),
+                            Some(Some(_)) if worker_loading => {
+                                let hint = worker_hint.unwrap_or("loading\u{2026}");
+                                (format!("<span class=\"loading\">{hint}</span>"), false)
+                            }
+                            Some(Some(_)) => {
+                                ("<span class=\"alive\">alive</span>".to_string(), false)
+                            }
+                            _ => ("<span class=\"dead\">dead</span>".to_string(), false),
                         };
 
                         // Per-worker stats from fuzzer_stats files
@@ -605,25 +640,32 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
                         let mut actions = String::new();
                         if let Some(Some(_)) = processes.get(slot_idx) {
                             if is_paused {
-                                let _ = write!(actions, "<a class=\"action-btn\" href=\"/resume?slot={slot_idx}\">resume</a>");
+                                let _ = write!(actions, "<a class=\"action-btn\" href=\"/resume?slot={slot_idx}&amp;tab={active_tab}\" title=\"resume\">\u{25b6}</a>");
                             } else {
-                                let _ = write!(actions, "<a class=\"action-btn\" href=\"/pause?slot={slot_idx}\">pause</a>");
+                                let _ = write!(actions, "<a class=\"action-btn\" href=\"/pause?slot={slot_idx}&amp;tab={active_tab}\" title=\"pause\">\u{23f8}</a>");
                             }
                             if !is_main {
-                                let _ = write!(actions, "<a class=\"action-btn danger\" href=\"/remove?slot={slot_idx}\">remove</a>");
+                                let _ = write!(actions, "<a class=\"action-btn danger\" href=\"/remove?slot={slot_idx}&amp;tab={active_tab}\" title=\"remove\">\u{2716}</a>");
                             }
                         }
 
+                        let cmd_title = processes
+                            .get(slot_idx)
+                            .and_then(|o| o.as_ref())
+                            .and_then(|ps| ps.command.as_deref())
+                            .unwrap_or("");
+                        let cmd_escaped = html_escape_attr(cmd_title);
+                        let td_attr = if cmd_escaped.is_empty() {
+                            String::new()
+                        } else {
+                            let js_escaped = cmd_title.replace('\\', "\\\\").replace('\'', "\\'");
+                            format!(" class=\"path-copy\" title=\"{cmd_escaped}\" onclick=\"navigator.clipboard.writeText('{js_escaped}')\"")
+                        };
                         let _ = writeln!(
                             buf,
-                            "<tr class=\"worker-row\"><td>{label}</td><td>{worker_status}</td><td>{w_exec}</td><td>{w_corpus}</td><td>{w_crashes}</td><td>{actions}</td></tr>"
+                            "<tr class=\"worker-row\"><td{td_attr}>{label}</td><td>{worker_status}</td><td>{w_exec}</td><td>{w_corpus}</td><td>{w_crashes}</td><td>{actions}</td></tr>"
                         );
                     }
-                    // "Add worker" row
-                    let _ = writeln!(
-                        buf,
-                        "<tr class=\"worker-row\"><td></td><td></td><td></td><td></td><td></td><td><a class=\"action-btn\" href=\"/scale?e=afl&amp;d=1\">+ add AFL++ worker</a></td></tr>"
-                    );
                 }
             } else {
                 // honggfuzz / libfuzzer: single row with pause/resume
@@ -632,16 +674,30 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
                     if let Some(&slot_idx) = engine.process_indices.first() {
                         if let Some(Some(ps)) = processes.get(slot_idx) {
                             if ps.paused {
-                                let _ = write!(actions, "<a class=\"action-btn\" href=\"/resume?slot={slot_idx}\">resume</a>");
+                                let _ = write!(actions, "<a class=\"action-btn\" href=\"/resume?slot={slot_idx}&amp;tab={active_tab}\" title=\"resume\">\u{25b6}</a>");
                             } else {
-                                let _ = write!(actions, "<a class=\"action-btn\" href=\"/pause?slot={slot_idx}\">pause</a>");
+                                let _ = write!(actions, "<a class=\"action-btn\" href=\"/pause?slot={slot_idx}&amp;tab={active_tab}\" title=\"pause\">\u{23f8}</a>");
                             }
                         }
                     }
                 }
+                let cmd_title = engine
+                    .process_indices
+                    .first()
+                    .and_then(|&idx| processes.get(idx))
+                    .and_then(|o| o.as_ref())
+                    .and_then(|ps| ps.command.as_deref())
+                    .unwrap_or("");
+                let cmd_escaped = html_escape_attr(cmd_title);
+                let td_attr = if cmd_escaped.is_empty() {
+                    String::new()
+                } else {
+                    let js_escaped = cmd_title.replace('\\', "\\\\").replace('\'', "\\'");
+                    format!(" class=\"path-copy\" title=\"{cmd_escaped}\" onclick=\"navigator.clipboard.writeText('{js_escaped}')\"")
+                };
                 let _ = writeln!(
                     buf,
-                    "<tr><td>{}</td><td>{status}</td><td>{exec_s}</td><td>{}</td><td>{}</td><td>{actions}</td></tr>",
+                    "<tr><td{td_attr}>{}</td><td>{status}</td><td>{exec_s}</td><td>{}</td><td>{}</td><td>{actions}</td></tr>",
                     es.name, es.corpus_count, es.crashes
                 );
             }
@@ -655,6 +711,7 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
             ("cpu", "CPU"),
             ("mem", "Memory"),
         ];
+        let _ = write!(buf, "<div id=\"graph-area\">");
         let _ = write!(buf, "<div class=\"tab-bar\">");
         for (id, label) in &tabs {
             let cls = if *id == active_tab {
@@ -677,12 +734,13 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
                 &graph_names,
                 &graph_colors,
             ),
-            "corpus" => self.render_scalar_chart(
+            "corpus" => self.render_line_chart(
                 &mut buf,
                 "Corpus Size",
                 "files",
                 &self.corpus_history,
-                "#00d4ff",
+                &graph_names,
+                &graph_colors,
             ),
             "cpu" => self.render_line_chart(
                 &mut buf,
@@ -702,6 +760,8 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
             ),
         }
 
+        let _ = writeln!(buf, "</div>"); // close graph-area
+
         // Strategy + Stop
         let _ = writeln!(buf, "<div class=\"actions\">");
         if self.show_switch_hints {
@@ -717,6 +777,10 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
                 buf,
                 "<form method=\"get\" action=\"/switch\" style=\"display:inline\">"
             );
+            let _ = write!(
+                buf,
+                "<input type=\"hidden\" name=\"tab\" value=\"{active_tab}\">"
+            );
             let _ = write!(buf, "<select name=\"s\">");
             for (strat, value, label) in &options {
                 let selected = if *strat == cur { " selected" } else { "" };
@@ -728,7 +792,7 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
         }
         let _ = writeln!(
             buf,
-            "<form method=\"get\" action=\"/stop\" style=\"display:inline\"><button type=\"submit\" style=\"border-color:#f44336;color:#f44336\">Stop</button></form>"
+            "<form method=\"get\" action=\"/stop\" style=\"display:inline\"><input type=\"hidden\" name=\"tab\" value=\"{active_tab}\"><button type=\"submit\" style=\"border-color:#f44336;color:#f44336\">Stop</button></form>"
         );
         let _ = writeln!(buf, "</div>");
 
@@ -776,8 +840,9 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
         let _ = writeln!(
             buf,
             "<script>\
-document.querySelectorAll('.path-copy').forEach(function(el){{\
-el.addEventListener('click',function(){{\
+document.addEventListener('click',function(e){{\
+var el=e.target.closest('.path-copy');\
+if(!el)return;\
 var r=el.getBoundingClientRect();\
 var t=document.createElement('span');\
 t.textContent='Copied!';\
@@ -788,7 +853,21 @@ document.body.appendChild(t);\
 setTimeout(function(){{t.style.opacity='0'}},600);\
 setTimeout(function(){{t.remove()}},1000);\
 }});\
+setInterval(function(){{\
+fetch(window.location.href)\
+.then(function(r){{return r.text()}})\
+.then(function(html){{\
+var doc=new DOMParser().parseFromString(html,'text/html');\
+var ids=['runtime','last-sync','corpus-count','external-corpus',\
+'crash-count','syncing','stats-table','graph-area'];\
+ids.forEach(function(id){{\
+var fresh=doc.getElementById(id);\
+var live=document.getElementById(id);\
+if(fresh&&live)live.innerHTML=fresh.innerHTML;\
 }});\
+}})\
+.catch(function(){{}});\
+}},2000);\
 </script>"
         );
         let _ = writeln!(buf, "</body></html>");
@@ -914,89 +993,6 @@ setTimeout(function(){{t.remove()}},1000);\
                 "<text x=\"{lx}\" y=\"{ly}\" text-anchor=\"end\" font-size=\"9\" dx=\"-14\">{name}</text>"
             );
         }
-
-        let _ = writeln!(buf, "</svg>");
-    }
-
-    fn render_scalar_chart(
-        &self,
-        buf: &mut String,
-        title: &str,
-        y_label: &str,
-        data: &VecDeque<ScalarSample>,
-        color: &str,
-    ) {
-        if data.is_empty() {
-            return;
-        }
-
-        let (left, right, top, bottom) = (60.0_f64, 780.0, 10.0, 180.0);
-        let min_t = data.front().unwrap().elapsed_secs;
-        let max_t = data.back().unwrap().elapsed_secs;
-        let t_range = (max_t - min_t).max(1.0);
-
-        let y_max = {
-            let raw = data.iter().map(|s| s.value).fold(0.0_f64, f64::max);
-            round_up_nice(raw.max(1.0))
-        };
-
-        let _ = writeln!(
-            buf,
-            "<svg viewBox=\"0 0 800 200\" width=\"100%\" style=\"max-width:820px;margin:8px 0\">"
-        );
-        let _ = writeln!(
-            buf,
-            "<rect width=\"800\" height=\"200\" fill=\"#16213e\" rx=\"4\"/>"
-        );
-
-        let _ = writeln!(
-            buf,
-            "<text x=\"{left}\" y=\"{top}\" dy=\"10\" fill=\"#e0e0e0\" font-size=\"12\">{title}</text>"
-        );
-
-        for i in 0..=3 {
-            let frac = i as f64 / 3.0;
-            let y = bottom - frac * (bottom - top - 14.0);
-            let val = y_max * frac;
-            let label = format_compact(val);
-            let _ = writeln!(
-                buf,
-                "<line x1=\"{left}\" y1=\"{y}\" x2=\"{right}\" y2=\"{y}\" stroke=\"#333\" stroke-dasharray=\"4\"/>"
-            );
-            let _ = writeln!(
-                buf,
-                "<text x=\"{lx}\" y=\"{y}\" dy=\"3\" text-anchor=\"end\">{label}</text>",
-                lx = left - 4.0
-            );
-        }
-
-        let _ = writeln!(
-            buf,
-            "<text x=\"14\" y=\"100\" transform=\"rotate(-90,14,100)\" text-anchor=\"middle\" font-size=\"10\">{y_label}</text>"
-        );
-
-        render_x_labels(buf, min_t, max_t, left, right, bottom);
-        self.render_sync_bands(buf, min_t, t_range, left, right, top, bottom);
-
-        let step = if data.len() > 600 {
-            data.len() / 300
-        } else {
-            1
-        };
-
-        let mut points = String::new();
-        for (j, sample) in data.iter().enumerate() {
-            if j % step != 0 && j != data.len() - 1 {
-                continue;
-            }
-            let x = left + (sample.elapsed_secs - min_t) / t_range * (right - left);
-            let y = bottom - (sample.value / y_max) * (bottom - top - 14.0);
-            let _ = write!(points, "{x:.1},{y:.1} ");
-        }
-        let _ = writeln!(
-            buf,
-            "<polyline points=\"{points}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"1.5\"/>"
-        );
 
         let _ = writeln!(buf, "</svg>");
     }
@@ -1127,6 +1123,7 @@ setTimeout(function(){{t.remove()}},1000);\
                     loading: false,
                     status_hint: None,
                 };
+                let mut stats_start_time: u64 = 0;
                 for line in contents.lines() {
                     if let Some((key, val)) = line.split_once(':') {
                         let key = key.trim();
@@ -1141,9 +1138,20 @@ setTimeout(function(){{t.remove()}},1000);\
                             "saved_crashes" => {
                                 ws.crashes = val.parse::<u64>().unwrap_or(0);
                             }
+                            "start_time" => {
+                                stats_start_time = val.parse::<u64>().unwrap_or(0);
+                            }
                             _ => {}
                         }
                     }
+                }
+                // Stale stats from a previous AFL_AUTORESUME session
+                let stale = stats_start_time > 0
+                    && stats_start_time < self.session_start_epoch.saturating_sub(5);
+                if stale {
+                    // Stats file is from a previous run; ignore its values
+                    ws.loading = true;
+                    ws.status_hint = Some("starting".to_string());
                 }
                 total.execs_per_sec += ws.execs_per_sec;
                 total.corpus_count += ws.corpus_count;
@@ -1163,6 +1171,9 @@ setTimeout(function(){{t.remove()}},1000);\
                 total.status_hint = Some("starting".to_string());
                 total.loading = true;
             }
+        } else if per_worker.values().all(|ws| ws.loading) {
+            total.loading = true;
+            total.status_hint = Some("starting".to_string());
         }
 
         (total, per_worker)
@@ -1264,14 +1275,19 @@ setTimeout(function(){{t.remove()}},1000);\
 
         stats.crashes = count_files(&format!("{}/libfuzzer/crashes", self.output_target));
 
+        if stats.execs_per_sec == 0.0 && !tail.is_empty() && !tail.contains("exec/s:") {
+            stats.status_hint = Some("starting".to_string());
+            stats.loading = true;
+        }
+
         stats
     }
 }
 
 // ── /proc readers ───────────────────────────────────────────────────────
 
-/// Sum utime + stime + cutime + cstime from /proc/{pid}/stat.
-/// cutime/cstime include CPU time of waited-for children (forkserver targets).
+/// Sum utime + stime from /proc/{pid}/stat.
+/// Excludes cutime/cstime to avoid huge spikes when forkserver children exit.
 fn read_proc_cpu_jiffies(pid: u32) -> u64 {
     let path = format!("/proc/{pid}/stat");
     let Ok(contents) = fs::read_to_string(path) else {
@@ -1282,7 +1298,7 @@ fn read_proc_cpu_jiffies(pid: u32) -> u64 {
         return 0;
     };
     let fields: Vec<&str> = rest.split_whitespace().collect();
-    // After closing paren: field 11 = utime, 12 = stime, 13 = cutime, 14 = cstime
+    // After closing paren: field 11 = utime, 12 = stime
     let utime = fields
         .get(11)
         .and_then(|s| s.parse::<u64>().ok())
@@ -1291,15 +1307,7 @@ fn read_proc_cpu_jiffies(pid: u32) -> u64 {
         .get(12)
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(0);
-    let cutime = fields
-        .get(13)
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    let cstime = fields
-        .get(14)
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or(0);
-    utime + stime + cutime + cstime
+    utime + stime
 }
 
 /// RSS in bytes from /proc/{pid}/statm field 1, multiplied by page_size.
@@ -1440,6 +1448,13 @@ fn parse_num(s: &str) -> f64 {
 }
 
 /// Count files in a directory (non-recursive).
+fn html_escape_attr(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+}
+
 fn count_files(dir: &str) -> u64 {
     fs::read_dir(dir)
         .map(|entries| {

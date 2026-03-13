@@ -976,8 +976,8 @@ impl Fuzz {
         }
     }
 
-    /// Spawn a single AFL++ secondary instance.
-    fn spawn_afl_secondary(&self, cargo: &str, job_num: u32) -> Result<process::Child> {
+    /// Spawn a single AFL++ secondary instance.  Returns (child, command_string).
+    fn spawn_afl_secondary(&self, cargo: &str, job_num: u32) -> Result<(process::Child, String)> {
         let afl_modes = [
             "explore", "fast", "coe", "lin", "quad", "exploit", "rare", "explore", "fast", "mmopt",
         ];
@@ -1055,7 +1055,13 @@ impl Fuzz {
         // Apply per-worker AFL env rules from TOML config.
         config::apply_afl_env_rules(&mut cmd, job_num, &self.afl_env_rules);
 
-        Ok(cmd.spawn()?)
+        let cmd_str = format!(
+            "AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1 {} {} {}",
+            cargo,
+            afl_args.join(" "),
+            target_path,
+        );
+        Ok((cmd.spawn()?, cmd_str))
     }
 
     fn spawn_afl(
@@ -1151,16 +1157,18 @@ impl Fuzz {
                 .process_group(0);
             config::apply_afl_env_rules(&mut cmd, job_num, &self.afl_env_rules);
 
+            let main_cmd_str = cmd_parts.join(" ");
             handles.push(Some(ProcessSlot {
                 child: cmd.spawn()?,
                 paused: false,
                 job_num: Some(0),
+                command: Some(main_cmd_str),
             }));
         }
 
         // Spawn secondaries (job_num 1..afl_jobs)
         for job_num in 1..afl_jobs {
-            let child = self.spawn_afl_secondary(cargo, job_num)?;
+            let (child, sec_cmd_str) = self.spawn_afl_secondary(cargo, job_num)?;
 
             // Build command string for logging
             let fuzzer_name = format!("-Ssecondaryfuzzer{job_num}");
@@ -1211,6 +1219,7 @@ impl Fuzz {
                 child,
                 paused: false,
                 job_num: Some(job_num),
+                command: Some(sec_cmd_str),
             }));
         }
 
@@ -1289,6 +1298,7 @@ impl Fuzz {
                 .spawn()?,
             paused: false,
             job_num: None,
+            command: Some(cmd_str.clone()),
         }));
 
         Ok(cmd_str)
@@ -1348,6 +1358,7 @@ impl Fuzz {
                 .with_context(|| format!("Failed to spawn libfuzzer binary: {binary}"))?,
             paused: false,
             job_num: None,
+            command: Some(cmd_str.clone()),
         }));
 
         Ok(cmd_str)
@@ -1389,12 +1400,13 @@ impl Fuzz {
             // Scale up
             for _ in 0..delta {
                 let job_num = self.next_afl_job_num;
-                let child = self.spawn_afl_secondary(&cargo, job_num)?;
+                let (child, cmd_str) = self.spawn_afl_secondary(&cargo, job_num)?;
                 let slot_idx = processes.len();
                 processes.push(Some(ProcessSlot {
                     child,
                     paused: false,
                     job_num: Some(job_num),
+                    command: Some(cmd_str),
                 }));
                 dashboard.engines[afl_idx].process_indices.push(slot_idx);
                 dashboard.engines[afl_idx].worker_count += 1;

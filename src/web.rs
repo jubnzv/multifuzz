@@ -117,23 +117,31 @@ pub fn start_server(
                         None => (full_path, ""),
                     };
 
+                    // Helper: extract tab param from query string
+                    let extract_tab = |q: &str| -> &'static str {
+                        let raw = q
+                            .split('&')
+                            .find_map(|kv| {
+                                let (k, v) = kv.split_once('=')?;
+                                if k == "tab" {
+                                    Some(v)
+                                } else {
+                                    None
+                                }
+                            })
+                            .unwrap_or("exec");
+                        match raw {
+                            "exec" => "exec",
+                            "corpus" => "corpus",
+                            "cpu" => "cpu",
+                            "mem" => "mem",
+                            _ => "exec",
+                        }
+                    };
+
                     match path {
                         "/" => {
-                            let tab = query
-                                .split('&')
-                                .find_map(|kv| {
-                                    let (k, v) = kv.split_once('=')?;
-                                    if k == "tab" {
-                                        Some(v)
-                                    } else {
-                                        None
-                                    }
-                                })
-                                .unwrap_or("exec");
-                            let tab = match tab {
-                                "exec" | "corpus" | "cpu" | "mem" => tab,
-                                _ => "exec",
-                            };
+                            let tab = extract_tab(query);
                             let guard = html.lock().unwrap();
                             let body = guard.get(tab).cloned().unwrap_or_default();
                             drop(guard);
@@ -192,7 +200,8 @@ pub fn start_server(
                                     let _ = cmd_tx.send(WebCommand::SwitchStrategy(st));
                                 }
                             }
-                            let resp = "HTTP/1.1 303 See Other\r\nLocation: /\r\nConnection: close\r\n\r\n";
+                            let tab = extract_tab(query);
+                            let resp = format!("HTTP/1.1 303 See Other\r\nLocation: /?tab={tab}\r\nConnection: close\r\n\r\n");
                             let _ = stream.write_all(resp.as_bytes());
                         }
                         "/scale" => {
@@ -213,7 +222,8 @@ pub fn start_server(
                                     let _ = cmd_tx.send(WebCommand::ScaleAfl(d));
                                 }
                             }
-                            let resp = "HTTP/1.1 303 See Other\r\nLocation: /\r\nConnection: close\r\n\r\n";
+                            let tab = extract_tab(query);
+                            let resp = format!("HTTP/1.1 303 See Other\r\nLocation: /?tab={tab}\r\nConnection: close\r\n\r\n");
                             let _ = stream.write_all(resp.as_bytes());
                         }
                         "/pause" | "/resume" | "/remove" => {
@@ -234,12 +244,14 @@ pub fn start_server(
                                 };
                                 let _ = cmd_tx.send(cmd);
                             }
-                            let resp = "HTTP/1.1 303 See Other\r\nLocation: /\r\nConnection: close\r\n\r\n";
+                            let tab = extract_tab(query);
+                            let resp = format!("HTTP/1.1 303 See Other\r\nLocation: /?tab={tab}\r\nConnection: close\r\n\r\n");
                             let _ = stream.write_all(resp.as_bytes());
                         }
                         "/stop" => {
                             stop.store(true, Ordering::Relaxed);
-                            let resp = "HTTP/1.1 303 See Other\r\nLocation: /\r\nConnection: close\r\n\r\n";
+                            let tab = extract_tab(query);
+                            let resp = format!("HTTP/1.1 303 See Other\r\nLocation: /?tab={tab}\r\nConnection: close\r\n\r\n");
                             let _ = stream.write_all(resp.as_bytes());
                         }
                         _ => {
