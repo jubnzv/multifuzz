@@ -17,6 +17,60 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+/// Per-worker AFL++ configuration computed by the distribution algorithm.
+struct AflWorkerConfig {
+    power_schedule: &'static str,
+    cmplog_level: Option<&'static str>,
+    mopt: bool,
+    old_queue: bool,
+}
+
+/// Compute AFL++ flags for a secondary worker based on total worker count.
+///
+/// Distributes power schedules, cmplog, MOPT, and old-queue evenly:
+/// - Power schedules rotate through all available modes.
+/// - Cmplog on ~20% of workers (min 1 if workers >= 3), varying `-l` levels.
+/// - MOPT (`-L0`) on ~10% of workers (min 1 if workers >= 5).
+/// - Old queue (`-Z`) on ~10% of workers (min 1 if workers >= 5), no overlap with MOPT.
+fn afl_worker_config(job_num: u32, total_secondaries: u32) -> AflWorkerConfig {
+    const SCHEDULES: &[&str] = &[
+        "explore", "fast", "coe", "exploit", "rare", "mmopt", "seek", "lin", "quad",
+    ];
+    const CMPLOG_LEVELS: &[&str] = &["-l2a", "-l1", "-l3at"];
+
+    let n = total_secondaries as usize;
+    let idx = (job_num - 1) as usize; // 0-based index among secondaries
+
+    let power_schedule = SCHEDULES[idx % SCHEDULES.len()];
+
+    // Cmplog: ~20% of workers, at least 1 when >= 3 secondaries.
+    let cmplog_count = if n >= 3 { (n / 5).max(1) } else { 0 };
+    let cmplog_level = if idx < cmplog_count {
+        Some(CMPLOG_LEVELS[idx % CMPLOG_LEVELS.len()])
+    } else {
+        None
+    };
+
+    // MOPT: ~10% of workers, at least 1 when >= 5 secondaries.
+    // Placed after cmplog workers to avoid overlap.
+    let mopt_count = if n >= 5 { (n / 10).max(1) } else { 0 };
+    let mopt_start = cmplog_count;
+    let mopt = idx >= mopt_start && idx < mopt_start + mopt_count;
+
+    // Old queue: ~10% of workers, at least 1 when >= 5 secondaries.
+    // Placed after MOPT workers to avoid overlap.
+    let old_queue_count = if n >= 5 { (n / 10).max(1) } else { 0 };
+    let old_queue_start = mopt_start + mopt_count;
+    let old_queue = idx >= old_queue_start && idx < old_queue_start + old_queue_count;
+
+    AflWorkerConfig {
+        power_schedule,
+        cmplog_level,
+        mopt,
+        old_queue,
+    }
+}
+
 /// Recursively collect all directories under `dir`.
 fn collect_dirs_recursively(dir: &Path, dir_list: &mut HashSet<PathBuf>) {
     if let Ok(entries) = fs::read_dir(dir) {
@@ -978,27 +1032,21 @@ impl Fuzz {
 
     /// Spawn a single AFL++ secondary instance.  Returns (child, command_string).
     fn spawn_afl_secondary(&self, cargo: &str, job_num: u32) -> Result<(process::Child, String)> {
-        let afl_modes = [
-            "explore", "fast", "coe", "lin", "quad", "exploit", "rare", "explore", "fast", "mmopt",
-        ];
+        let total_secondaries = self.next_afl_job_num.max(job_num + 1) - 1;
+        let wc = afl_worker_config(job_num, total_secondaries);
 
         let afl_input_dir = self.afl_input_dir()?;
         let dict_flags = self.afl_dict_flags();
 
         let fuzzer_name = format!("-Ssecondaryfuzzer{job_num}");
-        let mopt = if job_num % 10 == 9 { "-L0" } else { "" };
-        let power_schedule = afl_modes
-            .get(job_num as usize % afl_modes.len())
-            .unwrap_or(&"fast");
-        let old_queue = if job_num % 10 == 8 { "-Z" } else { "" };
+        let power_schedule = wc.power_schedule;
+        let mopt = if wc.mopt { "-L0" } else { "" };
+        let old_queue = if wc.old_queue { "-Z" } else { "" };
 
         let target_path_str = format!("./target/afl/debug/{}", self.target());
-        let cmplog_flags: Vec<String> = match job_num {
-            1 => vec![format!("-c{target_path_str}"), "-l2a".to_string()],
-            3 => vec![format!("-c{target_path_str}"), "-l1".to_string()],
-            14 => vec![format!("-c{target_path_str}"), "-l2a".to_string()],
-            22 => vec![format!("-c{target_path_str}"), "-l3at".to_string()],
-            _ => vec![],
+        let cmplog_flags: Vec<String> = match wc.cmplog_level {
+            Some(level) => vec![format!("-c{target_path_str}"), level.to_string()],
+            None => vec![],
         };
 
         let timeout_flag = match self.timeout {
@@ -1078,14 +1126,13 @@ impl Fuzz {
         afl_jobs: u32,
         handles: &mut Vec<Option<ProcessSlot>>,
     ) -> Result<Vec<String>> {
-        let afl_modes = [
-            "explore", "fast", "coe", "lin", "quad", "exploit", "rare", "explore", "fast", "mmopt",
-        ];
-
         let afl_input_dir = self.afl_input_dir()?;
         let dict_flags = self.afl_dict_flags();
 
         let mut cmds = Vec::new();
+
+        // Set next_afl_job_num early so spawn_afl_secondary sees total count.
+        self.next_afl_job_num = afl_jobs;
 
         // Spawn main instance (job_num=0) — unique -M flag, -F sync flags, AFL_FINAL_SYNC
         {
@@ -1103,7 +1150,7 @@ impl Fuzz {
                 String::new()
             };
 
-            let power_schedule = afl_modes[0];
+            let power_schedule = "explore";
             let timeout_flag = match self.timeout {
                 Some(t) => format!("-t{}", t * 1000),
                 None => String::new(),
@@ -1191,8 +1238,6 @@ impl Fuzz {
                 command: Some(sec_cmd_str),
             }));
         }
-
-        self.next_afl_job_num = afl_jobs;
 
         Ok(cmds)
     }
