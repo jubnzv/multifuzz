@@ -211,11 +211,7 @@ impl Dashboard {
 
     /// Record one tick of time-series data for graphs.
     /// AFL++ workers are expanded into individual graph lines.
-    pub fn record_tick(
-        &mut self,
-        corpus_count: u64,
-        processes: &[Option<ProcessSlot>],
-    ) {
+    pub fn record_tick(&mut self, corpus_count: u64, processes: &[Option<ProcessSlot>]) {
         let elapsed_secs = self.start_time.elapsed().as_secs_f64();
         let dt = elapsed_secs - self.prev_tick_secs;
         let first_tick = self.prev_tick_secs == 0.0;

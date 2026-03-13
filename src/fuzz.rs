@@ -1,5 +1,5 @@
 use crate::ui::{Dashboard, EngineInfo, EngineKind, ProcessSlot};
-use crate::{web, Build, Fuzz, Strategy};
+use crate::{config, web, Build, Fuzz, Strategy};
 use anyhow::{anyhow, Context, Result};
 use glob::glob;
 use std::{
@@ -83,13 +83,13 @@ impl Fuzz {
     fn corpus_dir(&self) -> String {
         match &self.corpus {
             Some(p) => p.display().to_string(),
-            None => format!("{}/{}/corpus", self.output.display(), self.target),
+            None => format!("{}/{}/corpus", self.output().display(), self.target()),
         }
     }
 
     /// `{output}/{target}` — the per-target output root.
     fn output_target(&self) -> String {
-        format!("{}/{}", self.output.display(), self.target)
+        format!("{}/{}", self.output().display(), self.target())
     }
 
     fn afl_enabled(&self) -> bool {
@@ -105,7 +105,7 @@ impl Fuzz {
         if self.no_afl {
             return true;
         }
-        self.jobs > 1
+        self.jobs() > 1
     }
 
     fn libfuzzer_enabled(&self) -> bool {
@@ -115,29 +115,39 @@ impl Fuzz {
     // ── public entry point ──────────────────────────────────────────────
 
     pub fn fuzz(&mut self) -> Result<()> {
+        // Load TOML config and merge with CLI args.
+        self.resolve_config()?;
+
+        // target is required
+        if self.target.is_none() {
+            return Err(anyhow!(
+                "target is required (positional arg or [fuzz] target in config)"
+            ));
+        }
+
         // Validate sequential mode args
-        if self.strategy == Strategy::Sequential && self.duration.is_none() {
+        if self.strategy() == Strategy::Sequential && self.duration.is_none() {
             return Err(anyhow!("--duration is required with --strategy sequential"));
         }
 
         // Validate single-engine strategies against --no-* flags
-        if self.strategy == Strategy::AflOnly && self.no_afl {
+        if self.strategy() == Strategy::AflOnly && self.no_afl {
             return Err(anyhow!("--strategy afl-only conflicts with --no-afl"));
         }
-        if self.strategy == Strategy::HonggOnly && self.no_honggfuzz {
+        if self.strategy() == Strategy::HonggOnly && self.no_honggfuzz {
             return Err(anyhow!(
                 "--strategy hongg-only conflicts with --no-honggfuzz"
             ));
         }
-        if self.strategy == Strategy::LibfuzzerOnly && self.no_libfuzzer {
+        if self.strategy() == Strategy::LibfuzzerOnly && self.no_libfuzzer {
             return Err(anyhow!(
                 "--strategy libfuzzer-only conflicts with --no-libfuzzer"
             ));
         }
 
         // Resolve output to an absolute path so all printed paths are absolute.
-        fs::create_dir_all(&self.output)?;
-        self.output = self.output.canonicalize()?;
+        fs::create_dir_all(self.output())?;
+        self.output = Some(self.output().canonicalize()?);
 
         // Build first — for sequential mode, build ALL engines regardless of
         // honggfuzz_enabled() which checks job count.
@@ -195,7 +205,7 @@ impl Fuzz {
             let (tx, rx) = mpsc::channel::<WebCommand>();
             let logs_dir = format!("{}/logs", self.output_target());
             let (handle, port) =
-                web::start_server(self.web_port, html.clone(), tx, &STOP, logs_dir)?;
+                web::start_server(self.web_port(), html.clone(), tx, &STOP, logs_dir)?;
             let url = format!("http://127.0.0.1:{port}");
             eprintln!("    Dashboard: {url}");
             let _ = process::Command::new("xdg-open")
@@ -220,7 +230,7 @@ impl Fuzz {
 
         let loop_start = Instant::now();
 
-        match self.strategy {
+        match self.strategy() {
             Strategy::Sequential => {
                 let duration_mins = self.duration.unwrap();
                 let engine_kinds = self.enabled_engine_kinds();
@@ -250,7 +260,7 @@ impl Fuzz {
                     eprintln!();
                     eprintln!("    ── {phase_label} ──");
 
-                    let (mut processes, engines) = self.spawn_single_engine(*kind, self.jobs)?;
+                    let (mut processes, engines) = self.spawn_single_engine(*kind, self.jobs())?;
 
                     let abs_corpus = fs::canonicalize(self.corpus_dir())
                         .map(|p| p.display().to_string())
@@ -268,10 +278,10 @@ impl Fuzz {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| crash_dir.clone());
                     let mut dashboard = Dashboard::new(
-                        &self.target,
+                        self.target(),
                         &self.output_target(),
                         engines,
-                        self.sync_interval,
+                        self.sync_interval(),
                         false,
                         None,
                         &abs_corpus,
@@ -300,7 +310,7 @@ impl Fuzz {
             }
             // Switchable strategies: Parallel + all single-engine variants
             _ => {
-                let mut current = self.strategy;
+                let mut current = self.strategy();
                 loop {
                     let (mut processes, engines) = self.spawn_for_strategy(current)?;
 
@@ -322,10 +332,10 @@ impl Fuzz {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| crash_dir.clone());
                     let mut dashboard = Dashboard::new(
-                        &self.target,
+                        self.target(),
                         &self.output_target(),
                         engines,
-                        self.sync_interval,
+                        self.sync_interval(),
                         true,
                         Some(current),
                         &abs_corpus,
@@ -485,7 +495,7 @@ impl Fuzz {
             }
 
             // ── corpus sync (every N minutes) ───────────────────────────
-            if last_sync_time.elapsed().as_secs() > self.sync_interval * 60 {
+            if last_sync_time.elapsed().as_secs() > self.sync_interval() * 60 {
                 dashboard.set_syncing(true);
                 if let Some(wh) = web_html {
                     let (stats, corpus, _) = dashboard.collect_stats(processes);
@@ -619,7 +629,7 @@ impl Fuzz {
         let mut dirs: Vec<(&str, PathBuf)> = afl_dirs;
         dirs.push((
             "honggfuzz",
-            format!("{}/honggfuzz/{}", self.output_target(), self.target).into(),
+            format!("{}/honggfuzz/{}", self.output_target(), self.target()).into(),
         ));
         if self.libfuzzer_enabled() {
             dirs.push((
@@ -719,7 +729,7 @@ impl Fuzz {
             is_new_file(f);
         }
 
-        let max_len = self.max_input_size as u64;
+        let max_len = self.max_input_size() as u64;
 
         // Merge engine files + external files into the same dedup pipeline
         let all_files: Vec<&PathBuf> = valid_files
@@ -894,7 +904,7 @@ impl Fuzz {
         let libf = self.libfuzzer_enabled();
 
         // With a single job and multiple engines, give it all to AFL (most effective solo).
-        if self.jobs == 1 {
+        if self.jobs() == 1 {
             if afl {
                 return (1, 0, 0);
             } else if hfuzz {
@@ -907,14 +917,14 @@ impl Fuzz {
         // Carve out libfuzzer jobs first.
         let lf_jobs = if libf {
             if !afl && !hfuzz {
-                self.jobs
+                self.jobs()
             } else {
-                std::cmp::min(self.jobs.div_ceil(4), 4)
+                std::cmp::min(self.jobs().div_ceil(4), 4)
             }
         } else {
             0
         };
-        let remaining = self.jobs - lf_jobs;
+        let remaining = self.jobs() - lf_jobs;
 
         // Split remaining between AFL++ and honggfuzz.
         let (a, h) = if !afl {
@@ -982,7 +992,7 @@ impl Fuzz {
             .unwrap_or(&"fast");
         let old_queue = if job_num % 10 == 8 { "-Z" } else { "" };
 
-        let target_path_str = format!("./target/afl/debug/{}", self.target);
+        let target_path_str = format!("./target/afl/debug/{}", self.target());
         let cmplog_flags: Vec<String> = match job_num {
             1 => vec![format!("-c{target_path_str}"), "-l2a".to_string()],
             3 => vec![format!("-c{target_path_str}"), "-l1".to_string()],
@@ -995,7 +1005,7 @@ impl Fuzz {
             Some(t) => format!("-t{}", t * 1000),
             None => String::new(),
         };
-        let max_len_flag = format!("-G{}", self.max_input_size);
+        let max_len_flag = format!("-G{}", self.max_input_size());
 
         let log_name = format!("afl_{job_num}.log");
         let log_destination = || -> Stdio {
@@ -1004,7 +1014,7 @@ impl Fuzz {
                 .into()
         };
 
-        let target_path = format!("./target/afl/debug/{}", self.target);
+        let target_path = format!("./target/afl/debug/{}", self.target());
 
         let afl_args: Vec<String> = [
             "afl".to_string(),
@@ -1023,8 +1033,8 @@ impl Fuzz {
         .chain(cmplog_flags.iter().cloned())
         .collect();
 
-        let child = process::Command::new(cargo)
-            .args(&afl_args)
+        let mut cmd = process::Command::new(cargo);
+        cmd.args(&afl_args)
             .args(&dict_flags)
             .arg(&target_path)
             .env("AFL_AUTORESUME", "1")
@@ -1040,10 +1050,12 @@ impl Fuzz {
             .env("AFL_IGNORE_SEED_PROBLEMS", "1")
             .stdout(log_destination())
             .stderr(log_destination())
-            .process_group(0)
-            .spawn()?;
+            .process_group(0);
 
-        Ok(child)
+        // Apply per-worker AFL env rules from TOML config.
+        config::apply_afl_env_rules(&mut cmd, job_num, &self.afl_env_rules);
+
+        Ok(cmd.spawn()?)
     }
 
     fn spawn_afl(
@@ -1082,7 +1094,7 @@ impl Fuzz {
                 Some(t) => format!("-t{}", t * 1000),
                 None => String::new(),
             };
-            let max_len_flag = format!("-G{}", self.max_input_size);
+            let max_len_flag = format!("-G{}", self.max_input_size());
 
             let log_destination = || -> Stdio {
                 File::create(format!("{}/logs/afl.log", self.output_target()))
@@ -1090,7 +1102,7 @@ impl Fuzz {
                     .into()
             };
 
-            let target_path = format!("./target/afl/debug/{}", self.target);
+            let target_path = format!("./target/afl/debug/{}", self.target());
 
             let afl_args: Vec<String> = [
                 "afl".to_string(),
@@ -1119,31 +1131,31 @@ impl Fuzz {
             cmd_parts.push(target_path.clone());
             cmds.push(cmd_parts.join(" "));
 
+            let mut cmd = process::Command::new(cargo);
+            cmd.args(&afl_args)
+                .args(&dict_flags)
+                .arg(&target_path)
+                .env("AFL_AUTORESUME", "1")
+                .env("AFL_TESTCACHE_SIZE", "100")
+                .env("AFL_FAST_CAL", "1")
+                .env("AFL_FORCE_UI", "1")
+                .env("AFL_IGNORE_UNKNOWN_ENVS", "1")
+                .env("AFL_CMPLOG_ONLY_NEW", "1")
+                .env("AFL_DISABLE_TRIM", "1")
+                .env("AFL_NO_WARN_INSTABILITY", "1")
+                .env("AFL_FUZZER_STATS_UPDATE_INTERVAL", "10")
+                .env("AFL_FINAL_SYNC", "1")
+                .env("AFL_IGNORE_SEED_PROBLEMS", "1")
+                .stdout(log_destination())
+                .stderr(log_destination())
+                .process_group(0);
+            config::apply_afl_env_rules(&mut cmd, job_num, &self.afl_env_rules);
+
             handles.push(Some(ProcessSlot {
-                child: process::Command::new(cargo)
-                    .args(&afl_args)
-                    .args(&dict_flags)
-                    .arg(&target_path)
-                    .env("AFL_AUTORESUME", "1")
-                    .env("AFL_TESTCACHE_SIZE", "100")
-                    .env("AFL_FAST_CAL", "1")
-                    .env("AFL_FORCE_UI", "1")
-                    .env("AFL_IGNORE_UNKNOWN_ENVS", "1")
-                    .env("AFL_CMPLOG_ONLY_NEW", "1")
-                    .env("AFL_DISABLE_TRIM", "1")
-                    .env("AFL_NO_WARN_INSTABILITY", "1")
-                    .env("AFL_FUZZER_STATS_UPDATE_INTERVAL", "10")
-                    .env("AFL_FINAL_SYNC", "1")
-                    .env("AFL_IGNORE_SEED_PROBLEMS", "1")
-                    .stdout(log_destination())
-                    .stderr(log_destination())
-                    .process_group(0)
-                    .spawn()?,
+                child: cmd.spawn()?,
                 paused: false,
                 job_num: Some(0),
             }));
-
-            let _ = job_num; // suppress unused warning
         }
 
         // Spawn secondaries (job_num 1..afl_jobs)
@@ -1159,11 +1171,11 @@ impl Fuzz {
                 Some(t) => format!("-t{}", t * 1000),
                 None => String::new(),
             };
-            let max_len_flag = format!("-G{}", self.max_input_size);
+            let max_len_flag = format!("-G{}", self.max_input_size());
             let mopt = if job_num % 10 == 9 { "-L0" } else { "" };
             let old_queue = if job_num % 10 == 8 { "-Z" } else { "" };
-            let target_path = format!("./target/afl/debug/{}", self.target);
-            let target_path_str = format!("./target/afl/debug/{}", self.target);
+            let target_path = format!("./target/afl/debug/{}", self.target());
+            let target_path_str = format!("./target/afl/debug/{}", self.target());
             let cmplog_flags: Vec<String> = match job_num {
                 1 => vec![format!("-c{target_path_str}"), "-l2a".to_string()],
                 3 => vec![format!("-c{target_path_str}"), "-l1".to_string()],
@@ -1239,7 +1251,7 @@ impl Fuzz {
              {timeout_flag} {dict_flag}",
             self.output_target(),
             self.output_target(),
-            self.max_input_size,
+            self.max_input_size(),
         );
 
         let cmd_str = format!(
@@ -1249,7 +1261,7 @@ impl Fuzz {
              HFUZZ_RUN_ARGS='{hfuzz_run_args}' \
              {cargo} hfuzz run {}",
             self.output_target(),
-            self.target,
+            self.target(),
         );
 
         let hfuzz_log = File::create(format!("{}/logs/honggfuzz.log", self.output_target()))?;
@@ -1260,7 +1272,7 @@ impl Fuzz {
                     "--flush",
                     "--quiet",
                     "-c",
-                    &format!("{cargo} hfuzz run {}", &self.target),
+                    &format!("{cargo} hfuzz run {}", self.target()),
                     "/dev/null",
                 ])
                 .env("HFUZZ_BUILD_ARGS", "--features=multifuzz/honggfuzz")
@@ -1290,7 +1302,7 @@ impl Fuzz {
         // The libfuzzer binary is built with --target=<triple> to isolate
         // SanitizerCoverage flags from build scripts.
         let host = std::env::consts::ARCH.to_string() + "-unknown-" + std::env::consts::OS + "-gnu";
-        let binary = format!("./target/libfuzzer/{host}/release/{}", self.target);
+        let binary = format!("./target/libfuzzer/{host}/release/{}", self.target());
         let corpus = self.corpus_dir();
 
         let mut args = vec![
@@ -1306,7 +1318,7 @@ impl Fuzz {
             "-ignore_crashes=1".to_string(),
             "-ignore_ooms=1".to_string(),
             "-ignore_timeouts=1".to_string(),
-            format!("-max_len={}", self.max_input_size),
+            format!("-max_len={}", self.max_input_size()),
         ];
 
         if let Some(t) = self.timeout {
@@ -1348,9 +1360,9 @@ impl Fuzz {
     ) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
         match s {
             Strategy::Parallel => self.spawn_fuzzers(),
-            Strategy::AflOnly => self.spawn_single_engine(EngineKind::Afl, self.jobs),
-            Strategy::HonggOnly => self.spawn_single_engine(EngineKind::Honggfuzz, self.jobs),
-            Strategy::LibfuzzerOnly => self.spawn_single_engine(EngineKind::Libfuzzer, self.jobs),
+            Strategy::AflOnly => self.spawn_single_engine(EngineKind::Afl, self.jobs()),
+            Strategy::HonggOnly => self.spawn_single_engine(EngineKind::Honggfuzz, self.jobs()),
+            Strategy::LibfuzzerOnly => self.spawn_single_engine(EngineKind::Libfuzzer, self.jobs()),
             Strategy::Sequential => unreachable!(),
         }
     }
@@ -1450,7 +1462,7 @@ impl Fuzz {
     /// Check for oversized files that would crash honggfuzz and prompt for removal.
     /// Must be called BEFORE the stdin command thread is spawned.
     fn check_honggfuzz_oversized_files(&self) -> Result<()> {
-        let max_len = self.max_input_size as u64;
+        let max_len = self.max_input_size() as u64;
         let mut oversized: Vec<PathBuf> = Vec::new();
         for dir in [
             format!("{}/queue", self.output_target()),
@@ -1468,7 +1480,7 @@ impl Fuzz {
             eprintln!(
                 "    Warning: {} file(s) exceed max_input_size ({} bytes) and will crash honggfuzz.",
                 oversized.len(),
-                self.max_input_size,
+                self.max_input_size(),
             );
             let mut by_dir: std::collections::HashMap<String, usize> =
                 std::collections::HashMap::new();

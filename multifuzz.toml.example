@@ -1,0 +1,41 @@
+# Example multifuzz config.
+# Copy to ./multifuzz.toml (or pass --config <path>).
+#
+# Equivalent to:
+#   AFL_SKIP_CPUFREQ=1 cargo run --release --manifest-path ~/Dev/multifuzz/Cargo.toml \
+#     -- fuzz multifuzz_source_fuzzer --sync-interval 60 -j 4 \
+#     -i ../../source_corpus -o ../../output/multi \
+#     -x ../../dicts/move.dict -x ../../dicts/move_rare.dict -x ../../dicts/crash.dict \
+#     -t 10 --external-corpus /tmp/move-corpus --strategy parallel --web
+#
+# With this config in place, the invocation simplifies to:
+#   AFL_SKIP_CPUFREQ=1 cargo run --release -- fuzz
+
+[fuzz]
+target = "multifuzz_source_fuzzer"
+jobs = 4
+corpus = "../../source_corpus"
+output = "../../output/multi"
+timeout = 10
+strategy = "parallel"
+sync_interval = 60
+dictionaries = [
+    "../../dicts/move.dict",
+    "../../dicts/move_rare.dict",
+    "../../dicts/crash.dict",
+]
+external_corpus = ["/tmp/move-corpus"]
+
+[fuzz.web]
+enabled = true
+
+# Per-worker AFL++ env overrides.
+# Keys: "all", "even", "odd", "workerN".
+# Applied AFTER hardcoded defaults, so they override them.
+
+[fuzz.afl.worker1.env]
+AFL_CUSTOM_MUTATOR_LIBRARY = "~/Sources/AFLplusplus/custom_mutators/radamsa/radamsa-mutator.so"
+AFL_CUSTOM_MUTATOR_ONLY = "1"
+
+[fuzz.afl.worker3.env]
+AFL_CUSTOM_MUTATOR_LIBRARY = "~/Sources/AFLplusplus/custom_mutators/grammar_mutator/grammar_mutator.so"

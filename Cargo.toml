@@ -9,7 +9,7 @@ license = "Apache-2.0"
 
 [features]
 default = ["cli"]
-cli = ["clap", "anyhow", "glob", "libc", "twox-hash"]
+cli = ["clap", "anyhow", "glob", "libc", "twox-hash", "serde", "toml"]
 afl = ["dep:afl"]
 honggfuzz = ["dep:honggfuzz"]
 libfuzzer = ["dep:libfuzzer-sys"]
@@ -24,6 +24,8 @@ anyhow = { version = "1", optional = true }
 glob = { version = "0.3", optional = true }
 libc = { version = "0.2", optional = true }
 twox-hash = { version = "2", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+toml = { version = "0.8", optional = true }
 
 [[bin]]
 name = "multifuzz"
