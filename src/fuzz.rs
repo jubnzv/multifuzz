@@ -1103,8 +1103,7 @@ impl Fuzz {
         // Apply per-worker AFL env rules from TOML config.
         config::apply_afl_env_rules(&mut cmd, job_num, &self.afl_env_rules);
 
-        let mut env_prefix =
-            String::from("AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1");
+        let mut env_prefix = String::from("AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1");
         for rule in &self.afl_env_rules {
             if rule.selector.matches(job_num) {
                 env_prefix.push_str(&format!(" {}={}", rule.key, rule.value));
