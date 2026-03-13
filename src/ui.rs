@@ -86,8 +86,6 @@ pub struct Dashboard {
     show_switch_hints: bool,
     /// Current strategy, for selecting the default in the dropdown.
     current_strategy: Option<Strategy>,
-    /// Number of AFL instances, for listing individual log files.
-    pub afl_job_count: u32,
     /// Path to the shared corpus directory.
     corpus_dir: String,
     /// External corpus directories (display only).
@@ -132,7 +130,6 @@ impl Dashboard {
         sync_interval: u64,
         show_switch_hints: bool,
         current_strategy: Option<Strategy>,
-        afl_job_count: u32,
         corpus_dir: &str,
         external_corpus: Vec<String>,
         crash_dir: &str,
@@ -151,7 +148,6 @@ impl Dashboard {
             sync_interval,
             show_switch_hints,
             current_strategy,
-            afl_job_count,
             corpus_dir: corpus_dir.to_string(),
             external_corpus,
             crash_dir: crash_dir.to_string(),
@@ -217,7 +213,6 @@ impl Dashboard {
     /// AFL++ workers are expanded into individual graph lines.
     pub fn record_tick(
         &mut self,
-        _stats: &[EngineStatsSnapshot],
         corpus_count: u64,
         processes: &[Option<ProcessSlot>],
     ) {

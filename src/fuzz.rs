@@ -252,11 +252,6 @@ impl Fuzz {
 
                     let (mut processes, engines) = self.spawn_single_engine(*kind, self.jobs)?;
 
-                    let afl_jobs = if matches!(kind, EngineKind::Afl) {
-                        self.jobs
-                    } else {
-                        0
-                    };
                     let abs_corpus = fs::canonicalize(self.corpus_dir())
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| self.corpus_dir());
@@ -279,7 +274,6 @@ impl Fuzz {
                         self.sync_interval,
                         false,
                         None,
-                        afl_jobs,
                         &abs_corpus,
                         abs_external,
                         &abs_crash,
@@ -312,11 +306,6 @@ impl Fuzz {
 
                     self.print_launch_info(&crash_dir);
 
-                    let afl_jobs = match current {
-                        Strategy::Parallel => self.allocate_jobs().0,
-                        Strategy::AflOnly => self.jobs,
-                        _ => 0,
-                    };
                     let abs_corpus = fs::canonicalize(self.corpus_dir())
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| self.corpus_dir());
@@ -339,7 +328,6 @@ impl Fuzz {
                         self.sync_interval,
                         true,
                         Some(current),
-                        afl_jobs,
                         &abs_corpus,
                         abs_external,
                         &abs_crash,
@@ -501,7 +489,7 @@ impl Fuzz {
                 dashboard.set_syncing(true);
                 if let Some(wh) = web_html {
                     let (stats, corpus, _) = dashboard.collect_stats(processes);
-                    dashboard.record_tick(&stats, corpus, processes);
+                    dashboard.record_tick(corpus, processes);
                     let mut map = HashMap::new();
                     for tab in &["exec", "corpus", "cpu", "mem"] {
                         map.insert(
@@ -526,7 +514,7 @@ impl Fuzz {
 
             // ── collect stats + update web + liveness check ─────────────
             let (stats, corpus, all_dead) = dashboard.collect_stats(processes);
-            dashboard.record_tick(&stats, corpus, processes);
+            dashboard.record_tick(corpus, processes);
 
             if let Some(wh) = web_html {
                 let mut map = HashMap::new();
@@ -1399,7 +1387,6 @@ impl Fuzz {
                 dashboard.engines[afl_idx].process_indices.push(slot_idx);
                 dashboard.engines[afl_idx].worker_count += 1;
                 self.next_afl_job_num += 1;
-                dashboard.afl_job_count += 1;
             }
         } else {
             // Scale down
@@ -1419,7 +1406,6 @@ impl Fuzz {
                 }
                 processes[slot_idx] = None;
                 engine.worker_count -= 1;
-                dashboard.afl_job_count -= 1;
             }
         }
 
@@ -1452,7 +1438,6 @@ impl Fuzz {
                 engine.process_indices.remove(pos);
                 engine.worker_count -= 1;
                 if matches!(engine.kind, EngineKind::Afl) {
-                    dashboard.afl_job_count -= 1;
                     let wc = engine.worker_count;
                     engine.name = format!("AFL++ ({wc}P)");
                 }
