@@ -1749,7 +1749,7 @@ fn send_signal_to_process_group(pid: u32, signal: libc::c_int) {
 
 fn handle_pause_slot(processes: &mut [Option<ProcessSlot>], slot: usize) {
     if let Some(ps) = processes.get_mut(slot).and_then(|o| o.as_mut()) {
-        if !ps.paused {
+        if !ps.paused && ps.child.try_wait().unwrap_or(None).is_none() {
             send_signal_to_process_group(ps.child.id(), libc::SIGSTOP);
             ps.paused = true;
         }
@@ -1758,7 +1758,7 @@ fn handle_pause_slot(processes: &mut [Option<ProcessSlot>], slot: usize) {
 
 fn handle_resume_slot(processes: &mut [Option<ProcessSlot>], slot: usize) {
     if let Some(ps) = processes.get_mut(slot).and_then(|o| o.as_mut()) {
-        if ps.paused {
+        if ps.paused && ps.child.try_wait().unwrap_or(None).is_none() {
             send_signal_to_process_group(ps.child.id(), libc::SIGCONT);
             ps.paused = false;
         }
@@ -1766,13 +1766,24 @@ fn handle_resume_slot(processes: &mut [Option<ProcessSlot>], slot: usize) {
 }
 
 fn stop_fuzzers(processes: &mut [Option<ProcessSlot>]) -> Result<()> {
+    // Send SIGTERM to all workers first.
     for slot in processes.iter_mut() {
-        if let Some(ps) = slot.take() {
+        if let Some(ps) = slot.as_mut() {
             if ps.paused {
                 send_signal_to_process_group(ps.child.id(), libc::SIGCONT);
             }
             kill_process_tree(ps.child.id())?;
         }
+    }
+    // Wait for all workers to actually terminate.
+    for slot in processes.iter_mut() {
+        if let Some(ps) = slot.as_mut() {
+            let _ = ps.child.wait();
+        }
+    }
+    // Now drop the slots.
+    for slot in processes.iter_mut() {
+        *slot = None;
     }
     Ok(())
 }
