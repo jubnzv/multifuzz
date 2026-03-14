@@ -556,7 +556,12 @@ impl Fuzz {
                     let (stats, corpus, _) = dashboard.collect_stats(processes);
                     dashboard.record_tick(corpus, processes);
                     let mut map = HashMap::new();
-                    for tab in &["exec", "corpus", "cpu", "mem"] {
+                    let tabs: &[&str] = if dashboard.has_external_corpus() {
+                        &["exec", "corpus", "cpu", "mem", "ext-corpus"]
+                    } else {
+                        &["exec", "corpus", "cpu", "mem"]
+                    };
+                    for tab in tabs {
                         map.insert(
                             tab.to_string(),
                             dashboard.render_html(&stats, corpus, processes, tab),
@@ -588,7 +593,12 @@ impl Fuzz {
 
             if let Some(wh) = web_html {
                 let mut map = HashMap::new();
-                for tab in &["exec", "corpus", "cpu", "mem"] {
+                let tabs: &[&str] = if dashboard.has_external_corpus() {
+                    &["exec", "corpus", "cpu", "mem", "ext-corpus"]
+                } else {
+                    &["exec", "corpus", "cpu", "mem"]
+                };
+                for tab in tabs {
                     map.insert(
                         tab.to_string(),
                         dashboard.render_html(&stats, corpus, processes, tab),
@@ -1232,7 +1242,6 @@ impl Fuzz {
             .args(&dict_flags)
             .arg(&target_path)
             .env("AFL_AUTORESUME", "1")
-            .env("AFL_TESTCACHE_SIZE", "100")
             .env("AFL_FAST_CAL", "1")
             .env("AFL_FORCE_UI", "1")
             .env("AFL_IGNORE_UNKNOWN_ENVS", "1")
@@ -1249,7 +1258,7 @@ impl Fuzz {
         // Apply per-worker AFL env rules from TOML config.
         config::apply_afl_env_rules(&mut cmd, job_num, &self.afl_env_rules);
 
-        let mut env_prefix = String::from("AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1");
+        let mut env_prefix = String::from("AFL_AUTORESUME=1 AFL_FAST_CAL=1");
         for rule in &self.afl_env_rules {
             if rule.selector.matches(job_num) {
                 env_prefix.push_str(&format!(" {}={}", rule.key, rule.value));
@@ -1327,7 +1336,7 @@ impl Fuzz {
             .collect();
 
             let mut env_prefix = String::from(
-                "AFL_AUTORESUME=1 AFL_TESTCACHE_SIZE=100 AFL_FAST_CAL=1 AFL_FINAL_SYNC=1",
+                "AFL_AUTORESUME=1 AFL_FAST_CAL=1 AFL_FINAL_SYNC=1",
             );
             for rule in &self.afl_env_rules {
                 if rule.selector.matches(job_num) {
@@ -1348,8 +1357,7 @@ impl Fuzz {
                 .args(&dict_flags)
                 .arg(&target_path)
                 .env("AFL_AUTORESUME", "1")
-                .env("AFL_TESTCACHE_SIZE", "100")
-                .env("AFL_FAST_CAL", "1")
+                    .env("AFL_FAST_CAL", "1")
                 .env("AFL_FORCE_UI", "1")
                 .env("AFL_IGNORE_UNKNOWN_ENVS", "1")
                 .env("AFL_CMPLOG_ONLY_NEW", "1")

@@ -135,6 +135,7 @@ pub fn start_server(
                             "corpus" => "corpus",
                             "cpu" => "cpu",
                             "mem" => "mem",
+                            "ext-corpus" => "ext-corpus",
                             _ => "exec",
                         }
                     };

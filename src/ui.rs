@@ -175,6 +175,10 @@ impl Dashboard {
 
     /// Snapshot current crash counts as the baseline so the dashboard only
     /// shows crashes from this session.
+    pub fn has_external_corpus(&self) -> bool {
+        !self.external_corpus.is_empty()
+    }
+
     pub fn set_syncing(&mut self, syncing: bool) {
         if syncing && !self.syncing {
             let elapsed = self.start_time.elapsed().as_secs_f64();
@@ -245,10 +249,10 @@ impl Dashboard {
             }
         };
 
-        // AFL worker color palette (cycle through shades of red/orange)
+        // AFL worker color palette — distinct hues so lines are easy to tell apart
         const AFL_COLORS: &[&str] = &[
-            "#ff6b6b", "#ff8e8e", "#ff4444", "#e05555", "#ff9955", "#ffb366", "#cc5544", "#ff7755",
-            "#dd6666", "#ee8844",
+            "#ff4444", "#4dabf7", "#ff922b", "#51cf66", "#cc5de8", "#20c997",
+            "#f06595", "#94d82d", "#fcc419", "#339af0",
         ];
 
         for engine in &self.engines {
@@ -509,8 +513,8 @@ svg text {{ font-family: monospace; font-size: 11px; fill: #888; }}
 .action-btn:hover {{ background: #1a3a5c; }}
 .action-btn.danger {{ border-color: #f44336; }}
 .action-btn.danger:hover {{ background: #5c1a1a; }}
-td[title] {{ cursor: help; border-bottom: 1px dotted #555; }}
-.path-copy {{ cursor:pointer; border-bottom: 1px dotted #888; }}
+td[title] {{ cursor: pointer; border-bottom: 1px dotted #555; }}
+.path-copy {{ cursor: pointer; border-bottom: 1px dotted #888; }}
 .path-copy:hover {{ color: #00d4ff; }}
 .tab-bar {{ margin: 10px 0; }}
 .tab {{ padding: 4px 12px; color: #888; text-decoration: none; margin-right: 4px; border-bottom: 2px solid transparent; }}
@@ -618,9 +622,14 @@ td[title] {{ cursor: help; border-bottom: 1px dotted #555; }}
                         let worker_stats = job_num.and_then(|jn| afl_worker_stats.get(&jn));
                         let worker_loading = worker_stats.map(|ws| ws.loading).unwrap_or(true); // no stats yet → loading
                         let worker_hint = worker_stats.and_then(|ws| ws.status_hint.as_deref());
+                        let worker_dead = worker_stats
+                            .is_some_and(|ws| !ws.alive && !ws.loading);
                         let (worker_status, is_paused) = match processes.get(slot_idx) {
                             Some(Some(ps)) if ps.paused => {
                                 ("<span class=\"paused\">paused</span>".to_string(), true)
+                            }
+                            Some(Some(_)) if worker_dead => {
+                                ("<span class=\"dead\">dead</span>".to_string(), false)
                             }
                             Some(Some(_)) if worker_loading => {
                                 let hint = worker_hint.unwrap_or("loading\u{2026}");
@@ -871,9 +880,19 @@ td[title] {{ cursor: help; border-bottom: 1px dotted #555; }}
                 }
             }
         }
+        let abs_logs_dir = std::fs::canonicalize(format!("{}/logs", self.output_target))
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| format!("{}/logs", self.output_target));
         let _ = write!(
             buf,
-            "</select> <button type=\"submit\">Show Logs</button></form>"
+            "</select> <button type=\"submit\">Show Logs</button>\
+             <button type=\"button\" class=\"action-btn\" \
+             onclick=\"var s=this.previousElementSibling.previousElementSibling;\
+             var f=s.options[s.selectedIndex].value;\
+             navigator.clipboard.writeText('{abs_logs_dir}/'+f+'.log');\
+             this.textContent='\\u2713';setTimeout(()=>this.textContent='\\u2398',800)\" \
+             title=\"Copy log path\">&#9112;</button>\
+             </form>"
         );
         let _ = writeln!(buf, "</div>");
 
@@ -1109,14 +1128,15 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
 
         if !found_stats {
             let log_path = format!("{}/logs/afl.log", self.output_target);
-            let tail = tail_file(&log_path, 4096);
-            if tail.contains("Attempting dry run") {
-                let done = tail.matches("Attempting dry run").count();
-                total.status_hint = Some(format!("importing seeds ({done})"));
+            if let Some((done, total_seeds)) = parse_afl_import_progress(&log_path) {
+                total.status_hint = Some(format!("importing seeds ({done}/{total_seeds})"));
                 total.loading = true;
-            } else if !tail.is_empty() {
-                total.status_hint = Some("starting".to_string());
-                total.loading = true;
+            } else {
+                let tail = tail_file(&log_path, 4096);
+                if !tail.is_empty() {
+                    total.status_hint = Some("starting".to_string());
+                    total.loading = true;
+                }
             }
         }
 
@@ -1164,6 +1184,7 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
                     status_hint: None,
                 };
                 let mut stats_start_time: u64 = 0;
+                let mut fuzzer_pid: u32 = 0;
                 for line in contents.lines() {
                     if let Some((key, val)) = line.split_once(':') {
                         let key = key.trim();
@@ -1181,9 +1202,17 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
                             "start_time" => {
                                 stats_start_time = val.parse::<u64>().unwrap_or(0);
                             }
+                            "fuzzer_pid" => {
+                                fuzzer_pid = val.parse::<u32>().unwrap_or(0);
+                            }
                             _ => {}
                         }
                     }
+                }
+                // Check if the fuzzer process is actually alive.
+                if fuzzer_pid > 0 {
+                    ws.alive =
+                        std::path::Path::new(&format!("/proc/{fuzzer_pid}")).exists();
                 }
                 // Stale stats from a previous AFL_AUTORESUME session
                 let stale = stats_start_time > 0
@@ -1193,24 +1222,69 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
                     ws.loading = true;
                     ws.status_hint = Some("starting".to_string());
                 }
-                total.execs_per_sec += ws.execs_per_sec;
-                total.corpus_count += ws.corpus_count;
-                total.crashes += ws.crashes;
+                if ws.alive {
+                    total.execs_per_sec += ws.execs_per_sec;
+                    total.corpus_count += ws.corpus_count;
+                    total.crashes += ws.crashes;
+                }
                 per_worker.insert(job_num, ws);
             }
         }
 
         if !found_stats {
-            let log_path = format!("{}/logs/afl.log", self.output_target);
-            let tail = tail_file(&log_path, 4096);
-            if tail.contains("Attempting dry run") {
-                let done = tail.matches("Attempting dry run").count();
-                total.status_hint = Some(format!("importing seeds ({done})"));
-                total.loading = true;
-            } else if !tail.is_empty() {
-                total.status_hint = Some("starting".to_string());
-                total.loading = true;
+            // Check per-worker logs for import progress
+            let worker_logs: Vec<(u32, String)> = {
+                let mut logs = vec![(0u32, format!("{}/logs/afl.log", self.output_target))];
+                for i in 1..32u32 {
+                    let p = format!("{}/logs/afl_{i}.log", self.output_target);
+                    if std::path::Path::new(&p).exists() {
+                        logs.push((i, p));
+                    } else {
+                        break;
+                    }
+                }
+                logs
+            };
+            let mut agg_done: u64 = 0;
+            let mut agg_total: u64 = 0;
+            let mut any_importing = false;
+            for (job_num, log_path) in &worker_logs {
+                if let Some((done, total_seeds)) = parse_afl_import_progress(log_path) {
+                    any_importing = true;
+                    agg_done += done;
+                    agg_total += total_seeds;
+                    per_worker.insert(*job_num, EngineStats {
+                        execs_per_sec: 0.0,
+                        corpus_count: 0,
+                        crashes: 0,
+                        alive: false,
+                        loading: true,
+                        status_hint: Some(format!("importing seeds ({done}/{total_seeds})")),
+                    });
+                } else {
+                    let tail = tail_file(log_path, 4096);
+                    if !tail.is_empty() {
+                        per_worker.insert(*job_num, EngineStats {
+                            execs_per_sec: 0.0,
+                            corpus_count: 0,
+                            crashes: 0,
+                            alive: false,
+                            loading: true,
+                            status_hint: Some("starting".to_string()),
+                        });
+                    }
+                }
             }
+            if any_importing {
+                total.status_hint = Some(format!("importing seeds ({agg_done}/{agg_total})"));
+            } else {
+                let main_log = format!("{}/logs/afl.log", self.output_target);
+                let tail = tail_file(&main_log, 4096);
+                if !tail.is_empty() {
+                    total.status_hint = Some("starting".to_string());
+                }
+            }
+            total.loading = true;
         } else if per_worker.values().all(|ws| ws.loading) {
             total.loading = true;
             total.status_hint = Some("starting".to_string());
@@ -1449,6 +1523,46 @@ pub fn tail_file(path: &str, n: u64) -> String {
     let mut buf = String::new();
     let _ = file.read_to_string(&mut buf);
     buf
+}
+
+/// Read the first `n` bytes of a file.
+fn head_file(path: &str, n: u64) -> String {
+    let Ok(file) = fs::File::open(path) else {
+        return String::new();
+    };
+    let mut buf = String::new();
+    let _ = file.take(n).read_to_string(&mut buf);
+    buf
+}
+
+/// Parse AFL++ seed import progress from a log file.
+/// Returns `Some((done, total))` when the log shows a dry run in progress.
+fn parse_afl_import_progress(log_path: &str) -> Option<(u64, u64)> {
+    // Read head to find total seed count ("Loaded a total of N seeds.")
+    let head = head_file(log_path, 8192);
+    let total = head
+        .find("Loaded a total of ")
+        .map(|i| &head[i + "Loaded a total of ".len()..])
+        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.parse::<u64>().ok())?;
+
+    // Read tail to find the last dry-run id
+    let tail = tail_file(log_path, 4096);
+    if !tail.contains("Attempting dry run") {
+        return None;
+    }
+    // Extract the last "id:NNNNNN" — the id is 0-indexed, so done = id + 1
+    let done = tail
+        .rmatch_indices("Attempting dry run with 'id:")
+        .next()
+        .and_then(|(i, _)| {
+            let after = &tail[i + "Attempting dry run with 'id:".len()..];
+            let num: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+            num.parse::<u64>().ok().map(|id| id + 1)
+        })
+        .unwrap_or(0);
+
+    Some((done, total))
 }
 
 /// Find the substring after the *last* occurrence of `prefix` in `haystack`.
