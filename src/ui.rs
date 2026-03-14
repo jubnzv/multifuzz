@@ -95,6 +95,8 @@ pub struct Dashboard {
     corpus_history: VecDeque<TimeSeriesSample>,
     cpu_history: VecDeque<TimeSeriesSample>,
     mem_history: VecDeque<TimeSeriesSample>,
+    /// External corpus file counts over time (one series per directory).
+    ext_corpus_history: VecDeque<TimeSeriesSample>,
 
     /// CPU jiffies at previous tick, keyed by PID.
     prev_cpu_jiffies: HashMap<u32, u64>,
@@ -155,6 +157,7 @@ impl Dashboard {
             corpus_history: VecDeque::with_capacity(GRAPH_MAX_SAMPLES),
             cpu_history: VecDeque::with_capacity(GRAPH_MAX_SAMPLES),
             mem_history: VecDeque::with_capacity(GRAPH_MAX_SAMPLES),
+            ext_corpus_history: VecDeque::with_capacity(GRAPH_MAX_SAMPLES),
             prev_cpu_jiffies: HashMap::new(),
             prev_tick_secs: 0.0,
             graph_labels: Vec::new(),
@@ -369,12 +372,26 @@ impl Dashboard {
             per_engine: mem_values,
         });
 
+        // External corpus file counts
+        if !self.external_corpus.is_empty() {
+            let ext_values: Vec<f64> = self
+                .external_corpus
+                .iter()
+                .map(|dir| count_files(dir) as f64)
+                .collect();
+            self.ext_corpus_history.push_back(TimeSeriesSample {
+                elapsed_secs,
+                per_engine: ext_values,
+            });
+        }
+
         // Evict old samples
         for buf in [
             &mut self.exec_history,
             &mut self.corpus_history,
             &mut self.cpu_history,
             &mut self.mem_history,
+            &mut self.ext_corpus_history,
         ] {
             while buf.len() > GRAPH_MAX_SAMPLES {
                 buf.pop_front();
@@ -705,12 +722,16 @@ td[title] {{ cursor: help; border-bottom: 1px dotted #555; }}
         let _ = writeln!(buf, "</table>");
 
         // Graphs section — tabbed
-        let tabs = [
+        let has_ext_corpus = !self.external_corpus.is_empty();
+        let mut tabs: Vec<(&str, &str)> = vec![
             ("exec", "Exec/s"),
             ("corpus", "Corpus"),
             ("cpu", "CPU"),
             ("mem", "Memory"),
         ];
+        if has_ext_corpus {
+            tabs.push(("ext-corpus", "Ext Corpus"));
+        }
         let _ = write!(buf, "<div id=\"graph-area\">");
         let _ = write!(buf, "<div class=\"tab-bar\">");
         for (id, label) in &tabs {
@@ -750,6 +771,24 @@ td[title] {{ cursor: help; border-bottom: 1px dotted #555; }}
                 &graph_names,
                 &graph_colors,
             ),
+            "ext-corpus" if has_ext_corpus => {
+                let ext_names: Vec<&str> =
+                    self.external_corpus.iter().map(|s| s.as_str()).collect();
+                const EXT_COLORS: &[&str] = &[
+                    "#7ec8e3", "#a3d977", "#c49bdb", "#e8c170", "#70d6d6", "#d4a0a0",
+                ];
+                let ext_colors: Vec<&str> = (0..self.external_corpus.len())
+                    .map(|i| EXT_COLORS[i % EXT_COLORS.len()])
+                    .collect();
+                self.render_line_chart(
+                    &mut buf,
+                    "External Corpus Files",
+                    "files",
+                    &self.ext_corpus_history,
+                    &ext_names,
+                    &ext_colors,
+                );
+            }
             _ => self.render_line_chart(
                 &mut buf,
                 "Memory (RSS)",
