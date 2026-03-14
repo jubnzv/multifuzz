@@ -805,8 +805,9 @@ td[title] {{ cursor: help; border-bottom: 1px dotted #555; }}
         let _ = writeln!(buf, "<div class=\"actions\">");
         if self.show_switch_hints {
             let _ = writeln!(buf, "<h2>Strategy</h2>");
-            let cur = self.current_strategy.unwrap_or(Strategy::Parallel);
+            let cur = self.current_strategy.unwrap_or(Strategy::AflFirst);
             let options = [
+                (Strategy::AflFirst, "afl-first", "AFL++ first"),
                 (Strategy::Parallel, "parallel", "Parallel"),
                 (Strategy::AflOnly, "afl-only", "AFL++ only"),
                 (Strategy::HonggOnly, "hongg-only", "honggfuzz only"),

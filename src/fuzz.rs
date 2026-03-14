@@ -366,6 +366,7 @@ impl Fuzz {
             _ => {
                 let mut current = self.strategy();
                 loop {
+                    self.strategy = Some(current);
                     let (mut processes, engines) = self.spawn_for_strategy(current)?;
 
                     self.print_launch_info(&crash_dir);
@@ -563,7 +564,12 @@ impl Fuzz {
                     }
                     *wh.lock().unwrap() = map;
                 }
-                match self.sync_corpus(last_synced_created_time) {
+                let sync_result = if self.strategy() == Strategy::AflFirst {
+                    self.sync_corpus_afl_first(last_synced_created_time)
+                } else {
+                    self.sync_corpus(last_synced_created_time)
+                };
+                match sync_result {
                     Ok(t) => last_synced_created_time = t,
                     Err(e) => {
                         if STOP.load(Ordering::Relaxed) {
@@ -822,6 +828,106 @@ impl Fuzz {
         Ok(newest_time)
     }
 
+    /// AflFirst sync: push seeds from libfuzzer/honggfuzz into AFL++ main queue.
+    /// Uses an in-memory hash set for O(1) dedup that scales to 200k+ files.
+    fn sync_corpus_afl_first(
+        &mut self,
+        last_synced: Option<SystemTime>,
+    ) -> Result<Option<SystemTime>> {
+        let afl_queue = format!("{}/afl/mainaflfuzzer/queue", self.output_target());
+        if !Path::new(&afl_queue).exists() {
+            return Ok(last_synced);
+        }
+
+        // First call: build the hash set from existing AFL queue contents.
+        if self.sync_hashes.is_empty() {
+            if let Ok(entries) = fs::read_dir(&afl_queue) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_file() {
+                        if let Ok(bytes) = fs::read(&path) {
+                            let hash = XxHash64::oneshot(0, &bytes);
+                            self.sync_hashes.insert(hash);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Collect new files from satellites only (no AFL, no cross-satellite sync).
+        let mut source_files: Vec<PathBuf> = vec![];
+        if self.honggfuzz_enabled() {
+            source_files
+                .extend(glob(&format!("{}/honggfuzz/corpus/*", self.output_target()))?.flatten());
+        }
+        if self.libfuzzer_enabled() {
+            source_files
+                .extend(glob(&format!("{}/libfuzzer/corpus/*", self.output_target()))?.flatten());
+        }
+
+        let external_files = self.collect_external_corpus_files(last_synced);
+
+        let mut newest_time = last_synced;
+        let max_len = self.max_input_size() as u64;
+
+        // Time-filter source files.
+        let mut is_new_file = |file: &PathBuf| -> bool {
+            if let Ok(metadata) = file.metadata() {
+                if let Ok(created) = metadata.created() {
+                    if last_synced.is_none_or(|time| created > time) {
+                        if newest_time.is_none_or(|time| created > time) {
+                            newest_time = Some(created);
+                        }
+                        return true;
+                    }
+                }
+            }
+            false
+        };
+
+        let valid_files: Vec<_> = source_files.iter().filter(|f| is_new_file(f)).collect();
+        for f in &external_files {
+            is_new_file(f);
+        }
+
+        let all_files: Vec<&PathBuf> =
+            valid_files.into_iter().chain(external_files.iter()).collect();
+
+        for file in all_files {
+            if !file.is_file() {
+                continue;
+            }
+            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+            if file_len > max_len || file_len == 0 {
+                continue;
+            }
+
+            let bytes = match fs::read(file) {
+                Ok(b) => b,
+                Err(_) => continue,
+            };
+            let hash = XxHash64::oneshot(0, &bytes);
+
+            if self.sync_hashes.contains(&hash) {
+                continue;
+            }
+
+            // Atomic write: temp file then rename.
+            let tmp_path = format!("{afl_queue}/.sync_tmp_{hash:x}");
+            let dest_path = format!("{afl_queue}/sync_ext_{hash:x}");
+            if Path::new(&dest_path).exists() {
+                self.sync_hashes.insert(hash);
+                continue;
+            }
+            if fs::write(&tmp_path, &bytes).is_ok() {
+                let _ = fs::rename(&tmp_path, &dest_path);
+            }
+            self.sync_hashes.insert(hash);
+        }
+
+        Ok(newest_time)
+    }
+
     /// Collect files from `--external-corpus` directories.
     ///
     /// Only files modified after `since` are returned, so we avoid re-scanning
@@ -874,15 +980,28 @@ impl Fuzz {
     // ── spawning ────────────────────────────────────────────────────────
 
     fn spawn_fuzzers(&mut self) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
-        if self.no_afl && self.no_honggfuzz && !self.libfuzzer_enabled() {
+        let (a, h, l) = self.allocate_jobs();
+        self.spawn_fuzzers_with_allocation(a, h, l)
+    }
+
+    fn spawn_fuzzers_afl_first(&mut self) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
+        let (a, h, l) = self.allocate_jobs_afl_first();
+        self.spawn_fuzzers_with_allocation(a, h, l)
+    }
+
+    fn spawn_fuzzers_with_allocation(
+        &mut self,
+        afl_jobs: u32,
+        honggfuzz_jobs: u32,
+        libfuzzer_jobs: u32,
+    ) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
+        if afl_jobs == 0 && honggfuzz_jobs == 0 && libfuzzer_jobs == 0 {
             return Err(anyhow!("Pick at least one fuzzer"));
         }
 
         let mut handles: Vec<Option<ProcessSlot>> = vec![];
         let mut engines = vec![];
         let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
-
-        let (afl_jobs, honggfuzz_jobs, libfuzzer_jobs) = self.allocate_jobs();
 
         if afl_jobs > 0 {
             fs::create_dir_all(format!("{}/afl", self.output_target()))?;
@@ -991,6 +1110,33 @@ impl Fuzz {
         };
 
         (a, h, lf_jobs)
+    }
+
+    /// AflFirst allocation: 1 libfuzzer fork, 1 honggfuzz thread, rest AFL.
+    /// With fewer than 3 jobs, satellites are silently disabled.
+    fn allocate_jobs_afl_first(&self) -> (u32, u32, u32) {
+        let afl = self.afl_enabled();
+        let hfuzz = self.honggfuzz_enabled();
+        let libf = self.libfuzzer_enabled();
+
+        // Fewer than 3 jobs: give everything to the primary engine.
+        if self.jobs() <= 2 {
+            if afl {
+                return (self.jobs(), 0, 0);
+            } else if hfuzz {
+                return (0, self.jobs(), 0);
+            } else {
+                return (0, 0, self.jobs());
+            }
+        }
+
+        // 3+ jobs: satellites get 1 each, AFL gets the rest.
+        let mut reserved = 0u32;
+        let h_jobs = if hfuzz { reserved += 1; 1 } else { 0 };
+        let lf_jobs = if libf { reserved += 1; 1 } else { 0 };
+        let a_jobs = if afl { self.jobs() - reserved } else { 0 };
+
+        (a_jobs, h_jobs, lf_jobs)
     }
 
     /// Compute the AFL++ input directory (resume-aware).
@@ -1383,6 +1529,7 @@ impl Fuzz {
         s: Strategy,
     ) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
         match s {
+            Strategy::AflFirst => self.spawn_fuzzers_afl_first(),
             Strategy::Parallel => self.spawn_fuzzers(),
             Strategy::AflOnly => self.spawn_single_engine(EngineKind::Afl, self.jobs()),
             Strategy::HonggOnly => self.spawn_single_engine(EngineKind::Honggfuzz, self.jobs()),

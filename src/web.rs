@@ -190,6 +190,7 @@ pub fn start_server(
                             });
                             if let Some(s) = strategy {
                                 let strat = match s {
+                                    "afl-first" => Some(Strategy::AflFirst),
                                     "parallel" => Some(Strategy::Parallel),
                                     "afl-only" => Some(Strategy::AflOnly),
                                     "hongg-only" => Some(Strategy::HonggOnly),

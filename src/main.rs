@@ -7,11 +7,14 @@ mod web;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Copy, Default, PartialEq, clap::ValueEnum)]
 pub enum Strategy {
     #[default]
+    #[clap(name = "afl-first")]
+    AflFirst,
     Parallel,
     Sequential,
     #[clap(name = "afl-only")]
@@ -127,6 +130,9 @@ pub struct Fuzz {
     /// Parsed AFL env rules from TOML config (not a CLI flag).
     #[clap(skip)]
     afl_env_rules: Vec<config::AflEnvRule>,
+    /// In-memory hash set for AflFirst sync dedup (survives across sync cycles).
+    #[clap(skip)]
+    sync_hashes: HashSet<u64>,
 }
 
 impl Fuzz {
@@ -171,6 +177,7 @@ impl Fuzz {
         // Strategy
         if self.strategy.is_none() {
             self.strategy = toml.strategy.as_deref().and_then(|s| match s {
+                "afl-first" => Some(Strategy::AflFirst),
                 "parallel" => Some(Strategy::Parallel),
                 "sequential" => Some(Strategy::Sequential),
                 "afl-only" => Some(Strategy::AflOnly),
@@ -179,7 +186,7 @@ impl Fuzz {
                 _ => None,
             });
         }
-        self.strategy = Some(self.strategy.unwrap_or(Strategy::Parallel));
+        self.strategy = Some(self.strategy.unwrap_or(Strategy::AflFirst));
 
         // Output defaults
         if self.output.is_none() {
