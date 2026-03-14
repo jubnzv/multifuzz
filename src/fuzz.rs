@@ -900,8 +900,10 @@ impl Fuzz {
             is_new_file(f);
         }
 
-        let all_files: Vec<&PathBuf> =
-            valid_files.into_iter().chain(external_files.iter()).collect();
+        let all_files: Vec<&PathBuf> = valid_files
+            .into_iter()
+            .chain(external_files.iter())
+            .collect();
 
         for file in all_files {
             if !file.is_file() {
@@ -1142,8 +1144,18 @@ impl Fuzz {
 
         // 3+ jobs: satellites get 1 each, AFL gets the rest.
         let mut reserved = 0u32;
-        let h_jobs = if hfuzz { reserved += 1; 1 } else { 0 };
-        let lf_jobs = if libf { reserved += 1; 1 } else { 0 };
+        let h_jobs = if hfuzz {
+            reserved += 1;
+            1
+        } else {
+            0
+        };
+        let lf_jobs = if libf {
+            reserved += 1;
+            1
+        } else {
+            0
+        };
         let a_jobs = if afl { self.jobs() - reserved } else { 0 };
 
         (a_jobs, h_jobs, lf_jobs)
@@ -1335,9 +1347,7 @@ impl Fuzz {
             .filter(|a| !a.is_empty())
             .collect();
 
-            let mut env_prefix = String::from(
-                "AFL_AUTORESUME=1 AFL_FAST_CAL=1 AFL_FINAL_SYNC=1",
-            );
+            let mut env_prefix = String::from("AFL_AUTORESUME=1 AFL_FAST_CAL=1 AFL_FINAL_SYNC=1");
             for rule in &self.afl_env_rules {
                 if rule.selector.matches(job_num) {
                     env_prefix.push_str(&format!(" {}={}", rule.key, rule.value));
@@ -1357,7 +1367,7 @@ impl Fuzz {
                 .args(&dict_flags)
                 .arg(&target_path)
                 .env("AFL_AUTORESUME", "1")
-                    .env("AFL_FAST_CAL", "1")
+                .env("AFL_FAST_CAL", "1")
                 .env("AFL_FORCE_UI", "1")
                 .env("AFL_IGNORE_UNKNOWN_ENVS", "1")
                 .env("AFL_CMPLOG_ONLY_NEW", "1")

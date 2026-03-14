@@ -43,12 +43,17 @@ pub struct EngineStatsSnapshot {
     pub execs_per_sec: f64,
     pub corpus_count: u64,
     pub crashes: u64,
+    pub execs_done: u64,
+    pub last_crash: u64,
 }
 
 struct EngineStats {
     execs_per_sec: f64,
     corpus_count: u64,
     crashes: u64,
+    execs_done: u64,
+    /// Unix timestamp (seconds) of last saved crash, 0 = none.
+    last_crash: u64,
     alive: bool,
     /// Engine is loading/importing corpus files.
     loading: bool,
@@ -251,8 +256,8 @@ impl Dashboard {
 
         // AFL worker color palette — distinct hues so lines are easy to tell apart
         const AFL_COLORS: &[&str] = &[
-            "#ff4444", "#4dabf7", "#ff922b", "#51cf66", "#cc5de8", "#20c997",
-            "#f06595", "#94d82d", "#fcc419", "#339af0",
+            "#ff4444", "#4dabf7", "#ff922b", "#51cf66", "#cc5de8", "#20c997", "#f06595", "#94d82d",
+            "#fcc419", "#339af0",
         ];
 
         for engine in &self.engines {
@@ -336,6 +341,8 @@ impl Dashboard {
                             execs_per_sec: 0.0,
                             corpus_count: 0,
                             crashes: 0,
+                            execs_done: 0,
+                            last_crash: 0,
                             alive: false,
                             loading: false,
                             status_hint: None,
@@ -438,6 +445,8 @@ impl Dashboard {
                 execs_per_sec: es.execs_per_sec,
                 corpus_count: es.corpus_count,
                 crashes: es.crashes,
+                execs_done: es.execs_done,
+                last_crash: es.last_crash,
             });
         }
 
@@ -572,7 +581,7 @@ td[title] {{ cursor: pointer; border-bottom: 1px dotted #555; }}
 
         let _ = writeln!(
             buf,
-            "<table id=\"stats-table\"><tr><th>Engine</th><th>Status</th><th>Exec/s</th><th>Corpus</th><th>Crashes</th><th>Actions</th></tr>"
+            "<table id=\"stats-table\"><tr><th>Engine</th><th>Status</th><th>Exec/s</th><th>Execs</th><th>Corpus</th><th>Crashes</th><th>Last Crash</th><th>Actions</th></tr>"
         );
         for (ei, es) in stats.iter().enumerate() {
             let engine = &self.engines[ei];
@@ -601,7 +610,7 @@ td[title] {{ cursor: pointer; border-bottom: 1px dotted #555; }}
                 };
                 let _ = writeln!(
                     buf,
-                    "<tr><td><b>AFL++</b></td><td></td><td></td><td></td><td></td><td>{afl_header_actions}</td></tr>",
+                    "<tr><td><b>AFL++</b></td><td></td><td></td><td></td><td></td><td></td><td></td><td>{afl_header_actions}</td></tr>",
                 );
 
                 // Per-worker sub-rows (only in switchable mode)
@@ -622,8 +631,7 @@ td[title] {{ cursor: pointer; border-bottom: 1px dotted #555; }}
                         let worker_stats = job_num.and_then(|jn| afl_worker_stats.get(&jn));
                         let worker_loading = worker_stats.map(|ws| ws.loading).unwrap_or(true); // no stats yet → loading
                         let worker_hint = worker_stats.and_then(|ws| ws.status_hint.as_deref());
-                        let worker_dead = worker_stats
-                            .is_some_and(|ws| !ws.alive && !ws.loading);
+                        let worker_dead = worker_stats.is_some_and(|ws| !ws.alive && !ws.loading);
                         let (worker_status, is_paused) = match processes.get(slot_idx) {
                             Some(Some(ps)) if ps.paused => {
                                 ("<span class=\"paused\">paused</span>".to_string(), true)
@@ -642,26 +650,29 @@ td[title] {{ cursor: pointer; border-bottom: 1px dotted #555; }}
                         };
 
                         // Per-worker stats from fuzzer_stats files
-                        let (w_exec, w_corpus, w_crashes) = if let Some(jn) = job_num {
-                            if let Some(ws) = afl_worker_stats.get(&jn) {
-                                let baseline =
-                                    self.baseline_worker_crashes.get(&jn).copied().unwrap_or(0);
-                                let crashes = ws.crashes.saturating_sub(baseline);
-                                (
-                                    if ws.execs_per_sec > 0.0 {
-                                        format!("{:.0}", ws.execs_per_sec)
-                                    } else {
-                                        "-".to_string()
-                                    },
-                                    format!("{}", ws.corpus_count),
-                                    format!("{crashes}"),
-                                )
+                        let (w_exec, w_execs_done, w_corpus, w_crashes, w_last_crash) =
+                            if let Some(jn) = job_num {
+                                if let Some(ws) = afl_worker_stats.get(&jn) {
+                                    let baseline =
+                                        self.baseline_worker_crashes.get(&jn).copied().unwrap_or(0);
+                                    let crashes = ws.crashes.saturating_sub(baseline);
+                                    (
+                                        if ws.execs_per_sec > 0.0 {
+                                            format!("{:.0}", ws.execs_per_sec)
+                                        } else {
+                                            "-".to_string()
+                                        },
+                                        fmt_execs(ws.execs_done),
+                                        format!("{}", ws.corpus_count),
+                                        format!("{crashes}"),
+                                        fmt_time_ago(ws.last_crash),
+                                    )
+                                } else {
+                                    ("-".into(), "-".into(), "-".into(), "-".into(), "-".into())
+                                }
                             } else {
-                                ("-".to_string(), "-".to_string(), "-".to_string())
-                            }
-                        } else {
-                            ("-".to_string(), "-".to_string(), "-".to_string())
-                        };
+                                ("-".into(), "-".into(), "-".into(), "-".into(), "-".into())
+                            };
 
                         let mut actions = String::new();
                         if let Some(Some(_)) = processes.get(slot_idx) {
@@ -689,7 +700,7 @@ td[title] {{ cursor: pointer; border-bottom: 1px dotted #555; }}
                         };
                         let _ = writeln!(
                             buf,
-                            "<tr class=\"worker-row\"><td{td_attr}>{label}</td><td>{worker_status}</td><td>{w_exec}</td><td>{w_corpus}</td><td>{w_crashes}</td><td>{actions}</td></tr>"
+                            "<tr class=\"worker-row\"><td{td_attr}>{label}</td><td>{worker_status}</td><td>{w_exec}</td><td>{w_execs_done}</td><td>{w_corpus}</td><td>{w_crashes}</td><td>{w_last_crash}</td><td>{actions}</td></tr>"
                         );
                     }
                 }
@@ -721,9 +732,11 @@ td[title] {{ cursor: pointer; border-bottom: 1px dotted #555; }}
                     let js_escaped = cmd_title.replace('\\', "\\\\").replace('\'', "\\'");
                     format!(" class=\"path-copy\" title=\"{cmd_escaped}\" onclick=\"navigator.clipboard.writeText('{js_escaped}')\"")
                 };
+                let e_execs_done = fmt_execs(es.execs_done);
+                let e_last_crash = fmt_time_ago(es.last_crash);
                 let _ = writeln!(
                     buf,
-                    "<tr><td{td_attr}>{}</td><td>{status}</td><td>{exec_s}</td><td>{}</td><td>{}</td><td>{actions}</td></tr>",
+                    "<tr><td{td_attr}>{}</td><td>{status}</td><td>{exec_s}</td><td>{e_execs_done}</td><td>{}</td><td>{}</td><td>{e_last_crash}</td><td>{actions}</td></tr>",
                     es.name, es.corpus_count, es.crashes
                 );
             }
@@ -1095,6 +1108,8 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
             execs_per_sec: 0.0,
             corpus_count: 0,
             crashes: 0,
+            execs_done: 0,
+            last_crash: 0,
             alive: false,
             loading: false,
             status_hint: None,
@@ -1118,6 +1133,15 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
                             }
                             "saved_crashes" => {
                                 total.crashes += val.parse::<u64>().unwrap_or(0);
+                            }
+                            "execs_done" => {
+                                total.execs_done += val.parse::<u64>().unwrap_or(0);
+                            }
+                            "last_crash" => {
+                                let v = val.parse::<u64>().unwrap_or(0);
+                                if v > total.last_crash {
+                                    total.last_crash = v;
+                                }
                             }
                             _ => {}
                         }
@@ -1151,6 +1175,8 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
             execs_per_sec: 0.0,
             corpus_count: 0,
             crashes: 0,
+            execs_done: 0,
+            last_crash: 0,
             alive: false,
             loading: false,
             status_hint: None,
@@ -1179,6 +1205,8 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
                     execs_per_sec: 0.0,
                     corpus_count: 0,
                     crashes: 0,
+                    execs_done: 0,
+                    last_crash: 0,
                     alive: false,
                     loading: false,
                     status_hint: None,
@@ -1205,14 +1233,19 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
                             "fuzzer_pid" => {
                                 fuzzer_pid = val.parse::<u32>().unwrap_or(0);
                             }
+                            "execs_done" => {
+                                ws.execs_done = val.parse::<u64>().unwrap_or(0);
+                            }
+                            "last_crash" => {
+                                ws.last_crash = val.parse::<u64>().unwrap_or(0);
+                            }
                             _ => {}
                         }
                     }
                 }
                 // Check if the fuzzer process is actually alive.
                 if fuzzer_pid > 0 {
-                    ws.alive =
-                        std::path::Path::new(&format!("/proc/{fuzzer_pid}")).exists();
+                    ws.alive = std::path::Path::new(&format!("/proc/{fuzzer_pid}")).exists();
                 }
                 // Stale stats from a previous AFL_AUTORESUME session
                 let stale = stats_start_time > 0
@@ -1226,6 +1259,10 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
                     total.execs_per_sec += ws.execs_per_sec;
                     total.corpus_count += ws.corpus_count;
                     total.crashes += ws.crashes;
+                    total.execs_done += ws.execs_done;
+                    if ws.last_crash > total.last_crash {
+                        total.last_crash = ws.last_crash;
+                    }
                 }
                 per_worker.insert(job_num, ws);
             }
@@ -1253,25 +1290,35 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
                     any_importing = true;
                     agg_done += done;
                     agg_total += total_seeds;
-                    per_worker.insert(*job_num, EngineStats {
-                        execs_per_sec: 0.0,
-                        corpus_count: 0,
-                        crashes: 0,
-                        alive: false,
-                        loading: true,
-                        status_hint: Some(format!("importing seeds ({done}/{total_seeds})")),
-                    });
-                } else {
-                    let tail = tail_file(log_path, 4096);
-                    if !tail.is_empty() {
-                        per_worker.insert(*job_num, EngineStats {
+                    per_worker.insert(
+                        *job_num,
+                        EngineStats {
                             execs_per_sec: 0.0,
                             corpus_count: 0,
                             crashes: 0,
+                            execs_done: 0,
+                            last_crash: 0,
                             alive: false,
                             loading: true,
-                            status_hint: Some("starting".to_string()),
-                        });
+                            status_hint: Some(format!("importing seeds ({done}/{total_seeds})")),
+                        },
+                    );
+                } else {
+                    let tail = tail_file(log_path, 4096);
+                    if !tail.is_empty() {
+                        per_worker.insert(
+                            *job_num,
+                            EngineStats {
+                                execs_per_sec: 0.0,
+                                corpus_count: 0,
+                                crashes: 0,
+                                execs_done: 0,
+                                last_crash: 0,
+                                alive: false,
+                                loading: true,
+                                status_hint: Some("starting".to_string()),
+                            },
+                        );
                     }
                 }
             }
@@ -1299,6 +1346,8 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
             execs_per_sec: 0.0,
             corpus_count: 0,
             crashes: 0,
+            execs_done: 0,
+            last_crash: 0,
             alive: false,
             loading: false,
             status_hint: None,
@@ -1340,6 +1389,17 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
                 .collect();
             stats.corpus_count = parse_num(&num) as u64;
         }
+        if let Some(v) = rfind_after(&tail, "Iterations : ") {
+            let clean = strip_ansi_inline(v);
+            let num: String = clean
+                .chars()
+                .take_while(|c| c.is_ascii_digit() || *c == ',')
+                .collect();
+            stats.execs_done = parse_num(&num) as u64;
+        }
+        // Last crash: newest file mtime in honggfuzz crash dir.
+        stats.last_crash =
+            newest_file_mtime(&format!("{}/honggfuzz/{}", self.output_target, self.target));
 
         if stats.execs_per_sec == 0.0 {
             if tail.contains("Loading dynamic input file") {
@@ -1362,6 +1422,8 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
             execs_per_sec: 0.0,
             corpus_count: 0,
             crashes: 0,
+            execs_done: 0,
+            last_crash: 0,
             alive: false,
             loading: false,
             status_hint: None,
@@ -1388,6 +1450,18 @@ if(fresh&&live)live.innerHTML=fresh.innerHTML;\
         }
 
         stats.crashes = count_files(&format!("{}/libfuzzer/crashes", self.output_target));
+        // Total execs from libfuzzer log.
+        for line in tail.lines().rev() {
+            if stats.execs_done == 0 {
+                if let Some(v) = extract_after(line, "stat::number_of_executed_units: ") {
+                    if let Some(num) = v.split_whitespace().next() {
+                        stats.execs_done = parse_num(num) as u64;
+                    }
+                }
+            }
+        }
+        // Last crash: newest file mtime in libfuzzer crash dir.
+        stats.last_crash = newest_file_mtime(&format!("{}/libfuzzer/crashes", self.output_target));
 
         if stats.execs_per_sec == 0.0 && !tail.is_empty() && !tail.contains("exec/s:") {
             stats.status_hint = Some("starting".to_string());
@@ -1617,6 +1691,59 @@ fn count_files(dir: &str) -> u64 {
                 .filter(|e| e.path().is_file())
                 .count() as u64
         })
+        .unwrap_or(0)
+}
+
+/// Format a unix timestamp as relative time ago, e.g. "2m", "1h", "3d".
+fn fmt_time_ago(unix_ts: u64) -> String {
+    if unix_ts == 0 {
+        return "-".to_string();
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    if unix_ts > now {
+        return "now".to_string();
+    }
+    let ago = now - unix_ts;
+    if ago < 60 {
+        format!("{ago}s")
+    } else if ago < 3600 {
+        format!("{}m", ago / 60)
+    } else if ago < 86400 {
+        format!("{}h", ago / 3600)
+    } else {
+        format!("{}d", ago / 86400)
+    }
+}
+
+/// Format a large number compactly: 1234 → "1234", 12345 → "12.3K", 1234567 → "1.2M".
+fn fmt_execs(n: u64) -> String {
+    if n == 0 {
+        return "-".to_string();
+    }
+    if n < 10_000 {
+        format!("{n}")
+    } else if n < 1_000_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else if n < 1_000_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else {
+        format!("{:.1}B", n as f64 / 1_000_000_000.0)
+    }
+}
+
+/// Get the mtime (as unix seconds) of the newest file in a directory.
+fn newest_file_mtime(dir: &str) -> u64 {
+    fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().is_file())
+        .filter_map(|e| e.metadata().ok()?.modified().ok())
+        .map(|t| t.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs())
+        .max()
         .unwrap_or(0)
 }
 
