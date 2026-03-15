@@ -121,6 +121,9 @@ pub fn apply_afl_env_rules(cmd: &mut process::Command, job_num: u32, rules: &[Af
     for rule in rules {
         if rule.selector.matches(job_num) {
             cmd.env(&rule.key, &rule.value);
+            if rule.key == "AFL_TMPDIR" {
+                let _ = std::fs::create_dir_all(&rule.value);
+            }
         }
     }
 }
