@@ -20,18 +20,27 @@ pub struct FuzzConfig {
     pub dictionaries: Option<Vec<PathBuf>>,
     pub external_corpus: Option<Vec<PathBuf>>,
     pub external_corpus_recursive: Option<bool>,
-    pub engines: Option<EnginesConfig>,
     pub web: Option<WebConfig>,
+    /// Honggfuzz config: [fuzz.honggfuzz.worker]. Present = enabled.
+    pub honggfuzz: Option<SatelliteEngineConfig>,
+    /// Libfuzzer config: [fuzz.libfuzzer.worker]. Present = enabled.
+    pub libfuzzer: Option<SatelliteEngineConfig>,
     /// Per-worker AFL++ configuration. Keys: "all" or "workerN".
     /// e.g. [fuzz.afl.all.env], [fuzz.afl.worker2.env]
     pub afl: Option<HashMap<String, AflWorkerConfig>>,
 }
 
-#[derive(Deserialize, Default)]
-pub struct EnginesConfig {
-    pub no_afl: Option<bool>,
-    pub no_honggfuzz: Option<bool>,
-    pub no_libfuzzer: Option<bool>,
+#[derive(Clone, Deserialize, Default)]
+pub struct SatelliteEngineConfig {
+    pub worker: Option<SatelliteWorkerConfig>,
+}
+
+#[derive(Clone, Deserialize, Default)]
+pub struct SatelliteWorkerConfig {
+    /// Extra CLI args appended to the auto-generated command.
+    pub args: Option<String>,
+    /// Extra env vars applied to the process.
+    pub env: Option<HashMap<String, String>>,
 }
 
 #[derive(Deserialize, Default)]

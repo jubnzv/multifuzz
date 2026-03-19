@@ -67,3 +67,21 @@ AFL_CUSTOM_MUTATOR_LIBRARY = "~/Sources/AFLplusplus/custom_mutators/grammar_muta
 # Fully custom command example (uncomment to use):
 # [fuzz.afl.worker3]
 # command = "cargo afl fuzz -Sgrammar -i ../../source_corpus -o ../../output/multi/afl -G8192 ./target/afl/debug/multifuzz_source_fuzzer"
+
+# ── Satellite engines ──────────────────────────────────────────────────
+# Present = enabled. Absent = disabled. Each takes 1 slot from total jobs.
+# Internal parallelism (threads/forks) is controlled via args.
+
+# Honggfuzz: extra args appended to the auto-generated command.
+# [fuzz.honggfuzz.worker]
+# args = "-n1"
+#
+# [fuzz.honggfuzz.worker.env]
+# CUSTOM_VAR = "value"
+
+# Libfuzzer: extra args appended to the auto-generated command.
+# [fuzz.libfuzzer.worker]
+# args = "-fork=1"
+#
+# [fuzz.libfuzzer.worker.env]
+# CUSTOM_VAR = "value"

@@ -28,7 +28,7 @@ pub struct Cli {
 pub enum Command {
     /// Build the fuzzer and runner binaries
     Build(Build),
-    /// Fuzz a target using AFL++ and honggfuzz in parallel
+    /// Fuzz a target
     Fuzz(Box<Fuzz>),
     /// Run specific inputs through the runner binary
     Run(Run),
@@ -78,12 +78,6 @@ pub struct Fuzz {
     /// Disable AFL++
     #[clap(long = "no-afl", action)]
     no_afl: bool,
-    /// Disable honggfuzz
-    #[clap(long = "no-honggfuzz", action)]
-    no_honggfuzz: bool,
-    /// Disable libfuzzer
-    #[clap(long = "no-libfuzzer", action)]
-    no_libfuzzer: bool,
     /// Maximum input size in bytes
     #[clap(long = "max-input-size", value_name = "BYTES")]
     max_input_size: Option<u32>,
@@ -111,6 +105,12 @@ pub struct Fuzz {
     /// Parsed per-worker AFL configs from TOML (not a CLI flag).
     #[clap(skip)]
     afl_worker_configs: config::AflWorkerConfigs,
+    /// Honggfuzz worker config from TOML. Present = enabled.
+    #[clap(skip)]
+    honggfuzz_config: Option<config::SatelliteWorkerConfig>,
+    /// Libfuzzer worker config from TOML. Present = enabled.
+    #[clap(skip)]
+    libfuzzer_config: Option<config::SatelliteWorkerConfig>,
     /// In-memory hash set for sync dedup (survives across sync cycles).
     #[clap(skip)]
     sync_hashes: HashSet<u64>,
@@ -157,29 +157,6 @@ impl Fuzz {
             self.output = Some(PathBuf::from(DEFAULT_OUTPUT_DIR));
         }
 
-        // Bool flags: CLI true wins, else TOML
-        if !self.no_afl {
-            self.no_afl = toml
-                .engines
-                .as_ref()
-                .and_then(|e| e.no_afl)
-                .unwrap_or(false);
-        }
-        if !self.no_honggfuzz {
-            self.no_honggfuzz = toml
-                .engines
-                .as_ref()
-                .and_then(|e| e.no_honggfuzz)
-                .unwrap_or(false);
-        }
-        if !self.no_libfuzzer {
-            self.no_libfuzzer = toml
-                .engines
-                .as_ref()
-                .and_then(|e| e.no_libfuzzer)
-                .unwrap_or(false);
-        }
-
         // Vec fields: CLI non-empty wins, else TOML
         if self.dictionaries.is_empty() {
             self.dictionaries = toml.dictionaries.unwrap_or_default();
@@ -205,6 +182,10 @@ impl Fuzz {
             .unwrap_or_default();
         self.afl_all_config = all_cfg;
         self.afl_worker_configs = worker_cfgs;
+
+        // Satellite engines: present in config = enabled
+        self.honggfuzz_config = toml.honggfuzz.and_then(|h| h.worker);
+        self.libfuzzer_config = toml.libfuzzer.and_then(|l| l.worker);
 
         Ok(())
     }

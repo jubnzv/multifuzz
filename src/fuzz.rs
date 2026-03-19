@@ -148,20 +148,12 @@ impl Fuzz {
         !self.no_afl
     }
 
-    /// Honggfuzz is enabled when not explicitly disabled and there are >1 jobs
-    /// (with a single job, AFL++ alone is more effective).
     fn honggfuzz_enabled(&self) -> bool {
-        if self.no_honggfuzz {
-            return false;
-        }
-        if self.no_afl {
-            return true;
-        }
-        self.jobs() > 1
+        self.honggfuzz_config.is_some()
     }
 
     fn libfuzzer_enabled(&self) -> bool {
-        !self.no_libfuzzer
+        self.libfuzzer_config.is_some()
     }
 
     // ── public entry point ──────────────────────────────────────────────
@@ -184,7 +176,7 @@ impl Fuzz {
         // Build all enabled engines.
         let build = Build {
             no_afl: !self.afl_enabled(),
-            no_honggfuzz: self.no_honggfuzz,
+            no_honggfuzz: !self.honggfuzz_enabled(),
             no_libfuzzer: !self.libfuzzer_enabled(),
         };
         build.build().context("Failed to build the fuzzers")?;
@@ -215,7 +207,7 @@ impl Fuzz {
 
         let crash_path = Path::new(&crash_dir);
 
-        if !self.no_honggfuzz {
+        if self.honggfuzz_enabled() {
             self.check_honggfuzz_oversized_files()?;
         }
 
@@ -693,7 +685,7 @@ impl Fuzz {
     // ── spawning ────────────────────────────────────────────────────────
 
     fn spawn_fuzzers_afl_first(&mut self) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
-        let (a, h, l) = self.allocate_jobs_afl_first();
+        let (a, h, l) = self.allocate_jobs();
         self.spawn_fuzzers_with_allocation(a, h, l)
     }
 
@@ -726,28 +718,26 @@ impl Fuzz {
 
         if honggfuzz_jobs > 0 {
             let start = handles.len();
-            let hfuzz_cmd = self.spawn_honggfuzz(&cargo, honggfuzz_jobs, &mut handles)?;
+            let _hfuzz_cmd = self.spawn_honggfuzz(&cargo, &mut handles)?;
             engines.push(EngineInfo {
-                name: format!("honggfuzz ({honggfuzz_jobs}T)"),
+                name: "honggfuzz".to_string(),
                 kind: EngineKind::Honggfuzz,
                 process_indices: (start..handles.len()).collect(),
                 worker_count: honggfuzz_jobs,
             });
-            eprintln!("    Launched honggfuzz ({honggfuzz_jobs} threads)");
-            eprintln!("      $ {hfuzz_cmd}");
+            eprintln!("    Launched honggfuzz");
         }
 
         if libfuzzer_jobs > 0 {
             let start = handles.len();
-            let lf_cmd = self.spawn_libfuzzer(libfuzzer_jobs, &mut handles)?;
+            let _lf_cmd = self.spawn_libfuzzer(&mut handles)?;
             engines.push(EngineInfo {
-                name: format!("libfuzzer ({libfuzzer_jobs}F)"),
+                name: "libfuzzer".to_string(),
                 kind: EngineKind::Libfuzzer,
                 process_indices: (start..handles.len()).collect(),
                 worker_count: libfuzzer_jobs,
             });
-            eprintln!("    Launched libfuzzer ({libfuzzer_jobs} workers)");
-            eprintln!("      $ {lf_cmd}");
+            eprintln!("    Launched libfuzzer");
         }
 
         // Print log paths so the user can tail them in another terminal.
@@ -775,42 +765,19 @@ impl Fuzz {
     }
 
     /// Allocate jobs between AFL++, honggfuzz and libfuzzer.
-    /// Returns (afl_jobs, honggfuzz_jobs, libfuzzer_jobs).
-    /// Job allocation: 1 libfuzzer fork, 1 honggfuzz thread, rest AFL.
-    /// With fewer than 3 jobs, satellites are silently disabled.
-    fn allocate_jobs_afl_first(&self) -> (u32, u32, u32) {
-        let afl = self.afl_enabled();
-        let hfuzz = self.honggfuzz_enabled();
-        let libf = self.libfuzzer_enabled();
-
-        // Fewer than 3 jobs: give everything to the primary engine.
-        if self.jobs() <= 2 {
-            if afl {
-                return (self.jobs(), 0, 0);
-            } else if hfuzz {
-                return (0, self.jobs(), 0);
-            } else {
-                return (0, 0, self.jobs());
-            }
-        }
-
-        // 3+ jobs: satellites get 1 each, AFL gets the rest.
-        let mut reserved = 0u32;
-        let h_jobs = if hfuzz {
-            reserved += 1;
-            1
+    /// Returns (afl_jobs, honggfuzz_slots, libfuzzer_slots).
+    /// Each configured satellite takes 1 slot from the total. AFL gets the rest.
+    /// Internal parallelism (hongg -n, libfuzzer -fork) is in user args.
+    fn allocate_jobs(&self) -> (u32, u32, u32) {
+        let satellites = self.honggfuzz_enabled() as u32 + self.libfuzzer_enabled() as u32;
+        let afl_jobs = if self.afl_enabled() {
+            self.jobs().saturating_sub(satellites)
         } else {
             0
         };
-        let lf_jobs = if libf {
-            reserved += 1;
-            1
-        } else {
-            0
-        };
-        let a_jobs = if afl { self.jobs() - reserved } else { 0 };
-
-        (a_jobs, h_jobs, lf_jobs)
+        let h = self.honggfuzz_enabled() as u32;
+        let l = self.libfuzzer_enabled() as u32;
+        (afl_jobs, h, l)
     }
 
     /// Compute the AFL++ input directory (resume-aware).
@@ -1098,10 +1065,10 @@ impl Fuzz {
     fn spawn_honggfuzz(
         &self,
         cargo: &str,
-        honggfuzz_jobs: u32,
         handles: &mut Vec<Option<ProcessSlot>>,
     ) -> Result<String> {
         let corpus = self.corpus_dir();
+        let worker_cfg = self.honggfuzz_config.as_ref();
 
         let timeout_flag = match self.timeout {
             Some(t) => format!("-t{t}"),
@@ -1116,53 +1083,67 @@ impl Fuzz {
             format!("-w{}", self.merged_dict.as_ref().unwrap().display())
         };
 
+        let extra_args = worker_cfg
+            .and_then(|c| c.args.as_deref())
+            .unwrap_or("");
+
         // The `script` invocation is a trick to get the correct TTY output for
         // honggfuzz (it requires a valid terminal).
         let hfuzz_run_args = format!(
             "--input={corpus} \
              -o{}/honggfuzz/corpus \
-             -n{honggfuzz_jobs} \
              --dynamic_input={}/queue \
              -F{} \
-             {timeout_flag} {dict_flag}",
+             {timeout_flag} {dict_flag} {extra_args}",
             self.output_target(),
             self.output_target(),
             self.max_input_size(),
         );
 
+        let hfuzz_workspace = format!("{}/honggfuzz", self.output_target());
+
+        // Collect all env vars for logging.
+        let mut env_vars = BTreeMap::new();
+        env_vars.insert(
+            "HFUZZ_BUILD_ARGS".to_string(),
+            "--features=multifuzz/honggfuzz".to_string(),
+        );
+        env_vars.insert("CARGO_TARGET_DIR".to_string(), "./target/honggfuzz".to_string());
+        env_vars.insert("HFUZZ_WORKSPACE".to_string(), hfuzz_workspace.clone());
+        env_vars.insert("HFUZZ_RUN_ARGS".to_string(), hfuzz_run_args.clone());
+        if let Some(user_env) = worker_cfg.and_then(|c| c.env.as_ref()) {
+            for (k, v) in user_env {
+                env_vars.insert(k.clone(), v.clone());
+            }
+        }
+
         let cmd_str = format!(
-            "HFUZZ_BUILD_ARGS='--features=multifuzz/honggfuzz' \
-             CARGO_TARGET_DIR=./target/honggfuzz \
-             HFUZZ_WORKSPACE={}/honggfuzz \
-             HFUZZ_RUN_ARGS='{hfuzz_run_args}' \
-             {cargo} hfuzz run {}",
-            self.output_target(),
+            "script --flush --quiet -c \"{cargo} hfuzz run {}\" /dev/null",
             self.target(),
         );
+        log_afl_worker(0, "honggfuzz", &env_vars, &cmd_str);
 
         let hfuzz_log = File::create(format!("{}/logs/honggfuzz.log", self.output_target()))?;
         let hfuzz_log_clone = hfuzz_log.try_clone()?;
+
+        let mut cmd = process::Command::new("script");
+        cmd.args([
+            "--flush",
+            "--quiet",
+            "-c",
+            &format!("{cargo} hfuzz run {}", self.target()),
+            "/dev/null",
+        ]);
+        for (k, v) in &env_vars {
+            cmd.env(k, v);
+        }
+        cmd.stdin(Stdio::null())
+            .stderr(hfuzz_log)
+            .stdout(hfuzz_log_clone)
+            .process_group(0);
+
         handles.push(Some(ProcessSlot {
-            child: process::Command::new("script")
-                .args([
-                    "--flush",
-                    "--quiet",
-                    "-c",
-                    &format!("{cargo} hfuzz run {}", self.target()),
-                    "/dev/null",
-                ])
-                .env("HFUZZ_BUILD_ARGS", "--features=multifuzz/honggfuzz")
-                .env("CARGO_TARGET_DIR", "./target/honggfuzz")
-                .env(
-                    "HFUZZ_WORKSPACE",
-                    format!("{}/honggfuzz", self.output_target()),
-                )
-                .env("HFUZZ_RUN_ARGS", &hfuzz_run_args)
-                .stdin(Stdio::null())
-                .stderr(hfuzz_log)
-                .stdout(hfuzz_log_clone)
-                .process_group(0)
-                .spawn()?,
+            child: cmd.spawn()?,
             paused: false,
             job_num: None,
             command: Some(cmd_str.clone()),
@@ -1173,9 +1154,10 @@ impl Fuzz {
 
     fn spawn_libfuzzer(
         &self,
-        libfuzzer_jobs: u32,
         handles: &mut Vec<Option<ProcessSlot>>,
     ) -> Result<String> {
+        let worker_cfg = self.libfuzzer_config.as_ref();
+
         // The libfuzzer binary is built with --target=<triple> to isolate
         // SanitizerCoverage flags from build scripts.
         let host = std::env::consts::ARCH.to_string() + "-unknown-" + std::env::consts::OS + "-gnu";
@@ -1189,7 +1171,6 @@ impl Fuzz {
                 "-artifact_prefix={}/libfuzzer/crashes/",
                 self.output_target()
             ),
-            format!("-fork={libfuzzer_jobs}"),
             "-reload=1".to_string(),
             "-print_final_stats=1".to_string(),
             "-ignore_crashes=1".to_string(),
@@ -1210,18 +1191,34 @@ impl Fuzz {
             args.push(format!("-dict={}", dict_path.display()));
         }
 
+        // Append user args from config.
+        if let Some(extra) = worker_cfg.and_then(|c| c.args.as_deref()) {
+            args.extend(extra.split_whitespace().map(String::from));
+        }
+
+        // Collect env for logging.
+        let env_vars: BTreeMap<String, String> = worker_cfg
+            .and_then(|c| c.env.as_ref())
+            .map(|e| e.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default();
+
         let cmd_str = format!("{binary} {}", args.join(" "));
+        log_afl_worker(0, "libfuzzer", &env_vars, &cmd_str);
 
         let lf_log = File::create(format!("{}/logs/libfuzzer.log", self.output_target()))?;
         let lf_log_clone = lf_log.try_clone()?;
 
+        let mut cmd = process::Command::new(&binary);
+        cmd.args(&args)
+            .stdout(lf_log)
+            .stderr(lf_log_clone)
+            .process_group(0);
+        for (k, v) in &env_vars {
+            cmd.env(k, v);
+        }
+
         handles.push(Some(ProcessSlot {
-            child: process::Command::new(&binary)
-                .args(&args)
-                .stdout(lf_log)
-                .stderr(lf_log_clone)
-                .process_group(0)
-                .spawn()
+            child: cmd.spawn()
                 .with_context(|| format!("Failed to spawn libfuzzer binary: {binary}"))?,
             paused: false,
             job_num: None,
