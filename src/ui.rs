@@ -1,4 +1,3 @@
-use crate::Strategy;
 use std::{
     collections::{HashMap, VecDeque},
     fmt::Write as FmtWrite,
@@ -84,10 +83,6 @@ pub struct Dashboard {
     last_sync: Option<String>,
     /// Sync interval in minutes, for display.
     sync_interval: u64,
-    /// Show strategy switching controls in web UI.
-    show_switch_hints: bool,
-    /// Current strategy, for selecting the default in the dropdown.
-    current_strategy: Option<Strategy>,
     /// Path to the shared corpus directory.
     corpus_dir: String,
     /// External corpus directories (display only).
@@ -135,8 +130,6 @@ impl Dashboard {
         output_target: &str,
         engines: Vec<EngineInfo>,
         sync_interval: u64,
-        show_switch_hints: bool,
-        current_strategy: Option<Strategy>,
         corpus_dir: &str,
         external_corpus: Vec<String>,
         crash_dir: &str,
@@ -153,8 +146,6 @@ impl Dashboard {
             syncing: false,
             last_sync: None,
             sync_interval,
-            show_switch_hints,
-            current_strategy,
             corpus_dir: corpus_dir.to_string(),
             external_corpus,
             crash_dir: crash_dir.to_string(),
@@ -603,7 +594,7 @@ td[title] {{ cursor: pointer; border-bottom: 1px dotted #555; }}
 
             if matches!(engine.kind, EngineKind::Afl) {
                 // AFL header row — per-worker statuses shown in sub-rows
-                let afl_header_actions = if self.show_switch_hints {
+                let afl_header_actions = if true {
                     &format!("<a class=\"action-btn\" href=\"/scale?e=afl&amp;d=1&amp;tab={active_tab}\" title=\"add AFL++ worker\">+</a>")
                 } else {
                     ""
@@ -614,7 +605,7 @@ td[title] {{ cursor: pointer; border-bottom: 1px dotted #555; }}
                 );
 
                 // Per-worker sub-rows (only in switchable mode)
-                if self.show_switch_hints {
+                if true {
                     for (pos, &slot_idx) in engine.process_indices.iter().enumerate() {
                         let is_main = pos == 0;
                         let (label, job_num) = if is_main {
@@ -707,7 +698,7 @@ td[title] {{ cursor: pointer; border-bottom: 1px dotted #555; }}
             } else {
                 // honggfuzz / libfuzzer: single row with pause/resume
                 let mut actions = String::new();
-                if self.show_switch_hints {
+                if true {
                     if let Some(&slot_idx) = engine.process_indices.first() {
                         if let Some(Some(ps)) = processes.get(slot_idx) {
                             if ps.paused {
@@ -823,35 +814,8 @@ td[title] {{ cursor: pointer; border-bottom: 1px dotted #555; }}
 
         let _ = writeln!(buf, "</div>"); // close graph-area
 
-        // Strategy + Stop
+        // Stop button
         let _ = writeln!(buf, "<div class=\"actions\">");
-        if self.show_switch_hints {
-            let _ = writeln!(buf, "<h2>Strategy</h2>");
-            let cur = self.current_strategy.unwrap_or(Strategy::AflFirst);
-            let options = [
-                (Strategy::AflFirst, "afl-first", "AFL++ first"),
-                (Strategy::Parallel, "parallel", "Parallel"),
-                (Strategy::AflOnly, "afl-only", "AFL++ only"),
-                (Strategy::HonggOnly, "hongg-only", "honggfuzz only"),
-                (Strategy::LibfuzzerOnly, "libfuzzer-only", "libfuzzer only"),
-            ];
-            let _ = write!(
-                buf,
-                "<form method=\"get\" action=\"/switch\" style=\"display:inline\">"
-            );
-            let _ = write!(
-                buf,
-                "<input type=\"hidden\" name=\"tab\" value=\"{active_tab}\">"
-            );
-            let _ = write!(buf, "<select name=\"s\">");
-            for (strat, value, label) in &options {
-                let selected = if *strat == cur { " selected" } else { "" };
-                let _ = write!(buf, "<option value=\"{value}\"{selected}>{label}</option>");
-            }
-            let _ = write!(buf, "</select> ");
-            let _ = write!(buf, "<button type=\"submit\">Switch</button>");
-            let _ = write!(buf, "</form> ");
-        }
         let _ = writeln!(
             buf,
             "<form method=\"get\" action=\"/stop\" style=\"display:inline\"><input type=\"hidden\" name=\"tab\" value=\"{active_tab}\"><button type=\"submit\" style=\"border-color:#f44336;color:#f44336\">Stop</button></form>"

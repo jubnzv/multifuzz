@@ -52,7 +52,6 @@ jobs = 4
 corpus = "./corpus"
 output = "./output"
 timeout = 10
-strategy = "parallel"       # "parallel", "afl-only", "hongg-only", "libfuzzer-only"
 sync_interval = 60
 dictionaries = ["./dict.dict"]
 

@@ -1,5 +1,4 @@
 use crate::fuzz::WebCommand;
-use crate::Strategy;
 use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
@@ -178,33 +177,6 @@ pub fn start_server(
                                     "HTTP/1.1 404 Not Found\r\nConnection: close\r\n\r\nNot Found";
                                 let _ = stream.write_all(resp.as_bytes());
                             }
-                        }
-                        "/switch" => {
-                            // Parse ?s=strategy
-                            let strategy = query.split('&').find_map(|kv| {
-                                let (k, v) = kv.split_once('=')?;
-                                if k == "s" {
-                                    Some(v)
-                                } else {
-                                    None
-                                }
-                            });
-                            if let Some(s) = strategy {
-                                let strat = match s {
-                                    "afl-first" => Some(Strategy::AflFirst),
-                                    "parallel" => Some(Strategy::Parallel),
-                                    "afl-only" => Some(Strategy::AflOnly),
-                                    "hongg-only" => Some(Strategy::HonggOnly),
-                                    "libfuzzer-only" => Some(Strategy::LibfuzzerOnly),
-                                    _ => None,
-                                };
-                                if let Some(st) = strat {
-                                    let _ = cmd_tx.send(WebCommand::SwitchStrategy(st));
-                                }
-                            }
-                            let tab = extract_tab(query);
-                            let resp = format!("HTTP/1.1 303 See Other\r\nLocation: /?tab={tab}\r\nConnection: close\r\n\r\n");
-                            let _ = stream.write_all(resp.as_bytes());
                         }
                         "/scale" => {
                             // Parse ?e=afl&d=N

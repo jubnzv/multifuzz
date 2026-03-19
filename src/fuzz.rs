@@ -1,5 +1,5 @@
 use crate::ui::{Dashboard, EngineInfo, EngineKind, ProcessSlot};
-use crate::{config, web, Build, Fuzz, Strategy};
+use crate::{config, web, Build, Fuzz};
 use anyhow::{anyhow, Context, Result};
 use glob::glob;
 use std::{
@@ -93,13 +93,7 @@ extern "C" fn handle_sigint(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-enum PhaseExit {
-    Done,
-    SwitchTo(Strategy),
-}
-
 pub enum WebCommand {
-    SwitchStrategy(Strategy),
     ScaleAfl(i32),
     PauseSlot(usize),
     ResumeSlot(usize),
@@ -183,32 +177,11 @@ impl Fuzz {
             ));
         }
 
-        // Validate sequential mode args
-        if self.strategy() == Strategy::Sequential && self.duration.is_none() {
-            return Err(anyhow!("--duration is required with --strategy sequential"));
-        }
-
-        // Validate single-engine strategies against --no-* flags
-        if self.strategy() == Strategy::AflOnly && self.no_afl {
-            return Err(anyhow!("--strategy afl-only conflicts with --no-afl"));
-        }
-        if self.strategy() == Strategy::HonggOnly && self.no_honggfuzz {
-            return Err(anyhow!(
-                "--strategy hongg-only conflicts with --no-honggfuzz"
-            ));
-        }
-        if self.strategy() == Strategy::LibfuzzerOnly && self.no_libfuzzer {
-            return Err(anyhow!(
-                "--strategy libfuzzer-only conflicts with --no-libfuzzer"
-            ));
-        }
-
         // Resolve output to an absolute path so all printed paths are absolute.
         fs::create_dir_all(self.output())?;
         self.output = Some(self.output().canonicalize()?);
 
-        // Build first — for sequential mode, build ALL engines regardless of
-        // honggfuzz_enabled() which checks job count.
+        // Build all enabled engines.
         let build = Build {
             no_afl: !self.afl_enabled(),
             no_honggfuzz: self.no_honggfuzz,
@@ -288,146 +261,45 @@ impl Fuzz {
 
         let loop_start = Instant::now();
 
-        match self.strategy() {
-            Strategy::Sequential => {
-                let duration_mins = self.duration.unwrap();
-                let engine_kinds = self.enabled_engine_kinds();
-                let num_engines = engine_kinds.len();
-                if num_engines == 0 {
-                    return Err(anyhow!("Pick at least one fuzzer"));
-                }
-                let phase_duration_secs = (duration_mins * 60) / num_engines as u64;
+        let (mut processes, engines) = self.spawn_fuzzers_afl_first()?;
+        self.print_launch_info(&crash_dir);
 
-                eprintln!(
-                    "    Sequential mode: {num_engines} engine(s), {} min each",
-                    phase_duration_secs / 60
-                );
-                self.print_launch_info(&crash_dir);
+        let abs_corpus = fs::canonicalize(self.corpus_dir())
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| self.corpus_dir());
+        let abs_external: Vec<String> = self
+            .external_corpus
+            .iter()
+            .map(|p| {
+                fs::canonicalize(p)
+                    .map(|c| c.display().to_string())
+                    .unwrap_or_else(|_| p.display().to_string())
+            })
+            .collect();
+        let abs_crash = fs::canonicalize(&crash_dir)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| crash_dir.clone());
+        let mut dashboard = Dashboard::new(
+            self.target(),
+            &self.output_target(),
+            engines,
+            self.sync_interval(),
+            &abs_corpus,
+            abs_external,
+            &abs_crash,
+        );
+        dashboard.record_baseline();
 
-                for (phase_idx, kind) in engine_kinds.iter().enumerate() {
-                    if STOP.load(Ordering::Relaxed) {
-                        break;
-                    }
+        self.run_phase(
+            &mut processes,
+            &mut dashboard,
+            crash_path,
+            cmd_rx.as_ref(),
+            web_html.as_ref(),
+        )?;
 
-                    let phase_label = format!(
-                        "Phase {}/{}: {}",
-                        phase_idx + 1,
-                        num_engines,
-                        engine_kind_name(*kind)
-                    );
-                    eprintln!();
-                    eprintln!("    ── {phase_label} ──");
-
-                    let (mut processes, engines) = self.spawn_single_engine(*kind, self.jobs())?;
-
-                    let abs_corpus = fs::canonicalize(self.corpus_dir())
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| self.corpus_dir());
-                    let abs_external: Vec<String> = self
-                        .external_corpus
-                        .iter()
-                        .map(|p| {
-                            fs::canonicalize(p)
-                                .map(|c| c.display().to_string())
-                                .unwrap_or_else(|_| p.display().to_string())
-                        })
-                        .collect();
-                    let abs_crash = fs::canonicalize(&crash_dir)
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| crash_dir.clone());
-                    let mut dashboard = Dashboard::new(
-                        self.target(),
-                        &self.output_target(),
-                        engines,
-                        self.sync_interval(),
-                        false,
-                        None,
-                        &abs_corpus,
-                        abs_external,
-                        &abs_crash,
-                    );
-                    dashboard.record_baseline();
-
-                    let phase_dur = Duration::from_secs(phase_duration_secs);
-                    let _ = self.run_phase(
-                        &mut processes,
-                        &mut dashboard,
-                        crash_path,
-                        Some(phase_dur),
-                        cmd_rx.as_ref(),
-                        web_html.as_ref(),
-                    )?;
-
-                    stop_fuzzers(&mut processes)?;
-                    let _ = self.collect_crashes(crash_path);
-
-                    // Force full corpus sync between phases so the next engine
-                    // sees everything from previous phases.
-                    let _ = self.sync_corpus(None);
-                }
-            }
-            // Switchable strategies: Parallel + all single-engine variants
-            _ => {
-                let mut current = self.strategy();
-                loop {
-                    self.strategy = Some(current);
-                    let (mut processes, engines) = self.spawn_for_strategy(current)?;
-
-                    self.print_launch_info(&crash_dir);
-
-                    let abs_corpus = fs::canonicalize(self.corpus_dir())
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| self.corpus_dir());
-                    let abs_external: Vec<String> = self
-                        .external_corpus
-                        .iter()
-                        .map(|p| {
-                            fs::canonicalize(p)
-                                .map(|c| c.display().to_string())
-                                .unwrap_or_else(|_| p.display().to_string())
-                        })
-                        .collect();
-                    let abs_crash = fs::canonicalize(&crash_dir)
-                        .map(|p| p.display().to_string())
-                        .unwrap_or_else(|_| crash_dir.clone());
-                    let mut dashboard = Dashboard::new(
-                        self.target(),
-                        &self.output_target(),
-                        engines,
-                        self.sync_interval(),
-                        true,
-                        Some(current),
-                        &abs_corpus,
-                        abs_external,
-                        &abs_crash,
-                    );
-                    dashboard.record_baseline();
-
-                    let (exit, _last_synced) = self.run_phase(
-                        &mut processes,
-                        &mut dashboard,
-                        crash_path,
-                        None,
-                        cmd_rx.as_ref(),
-                        web_html.as_ref(),
-                    )?;
-
-                    match exit {
-                        PhaseExit::Done => {
-                            stop_fuzzers(&mut processes)?;
-                            let _ = self.collect_crashes(crash_path);
-                            break;
-                        }
-                        PhaseExit::SwitchTo(new) => {
-                            stop_fuzzers(&mut processes)?;
-                            let _ = self.collect_crashes(crash_path);
-                            let _ = self.sync_corpus(None);
-                            current = new;
-                        }
-                    }
-                }
-            }
-        }
+        stop_fuzzers(&mut processes)?;
+        let _ = self.collect_crashes(crash_path);
 
         let elapsed = loop_start.elapsed().as_secs();
         let days = elapsed / 86400;
@@ -483,22 +355,17 @@ impl Fuzz {
     }
 
     /// Run the main tick loop: crash collection, corpus sync, optional web
-    /// dashboard update, liveness check. Returns the phase exit reason and the
-    /// last synced creation time.
-    ///
-    /// `phase_duration` of `None` means run forever (parallel mode).
+    /// dashboard update, liveness check.
     fn run_phase(
         &mut self,
         processes: &mut Vec<Option<ProcessSlot>>,
         dashboard: &mut Dashboard,
         crash_path: &Path,
-        phase_duration: Option<Duration>,
         cmd_rx: Option<&mpsc::Receiver<WebCommand>>,
         web_html: Option<&Arc<Mutex<HashMap<String, String>>>>,
-    ) -> Result<(PhaseExit, Option<SystemTime>)> {
+    ) -> Result<()> {
         let mut last_synced_created_time: Option<SystemTime> = None;
         let mut last_sync_time = Instant::now();
-        let phase_start = Instant::now();
 
         loop {
             if STOP.load(Ordering::Relaxed) {
@@ -511,21 +378,11 @@ impl Fuzz {
                 break;
             }
 
-            // Check phase duration timeout
-            if let Some(dur) = phase_duration {
-                if phase_start.elapsed() >= dur {
-                    break;
-                }
-            }
-
             // Drain web commands, batching rapid-fire scale clicks
             if let Some(rx) = cmd_rx {
                 let mut afl_delta: i32 = 0;
                 while let Ok(cmd) = rx.try_recv() {
                     match cmd {
-                        WebCommand::SwitchStrategy(s) => {
-                            return Ok((PhaseExit::SwitchTo(s), last_synced_created_time));
-                        }
                         WebCommand::ScaleAfl(d) => {
                             afl_delta += d;
                         }
@@ -573,11 +430,7 @@ impl Fuzz {
                     }
                     *wh.lock().unwrap() = map;
                 }
-                let sync_result = if self.strategy() == Strategy::AflFirst {
-                    self.sync_corpus_afl_first(last_synced_created_time)
-                } else {
-                    self.sync_corpus(last_synced_created_time)
-                };
+                let sync_result = self.sync_corpus_afl_first(last_synced_created_time);
                 match sync_result {
                     Ok(t) => last_synced_created_time = t,
                     Err(e) => {
@@ -616,76 +469,10 @@ impl Fuzz {
             }
         }
 
-        Ok((PhaseExit::Done, last_synced_created_time))
+        Ok(())
     }
 
-    /// Return the list of enabled engine kinds (respects --no-* flags).
-    /// In sequential mode, honggfuzz is enabled even with 1 job (it gets all jobs).
-    fn enabled_engine_kinds(&self) -> Vec<EngineKind> {
-        let mut kinds = Vec::new();
-        if self.afl_enabled() {
-            kinds.push(EngineKind::Afl);
-        }
-        if !self.no_honggfuzz {
-            kinds.push(EngineKind::Honggfuzz);
-        }
-        if self.libfuzzer_enabled() {
-            kinds.push(EngineKind::Libfuzzer);
-        }
-        kinds
-    }
 
-    /// Spawn a single engine with ALL jobs. Used by sequential mode.
-    fn spawn_single_engine(
-        &mut self,
-        kind: EngineKind,
-        jobs: u32,
-    ) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
-        let mut handles: Vec<Option<ProcessSlot>> = vec![];
-        let mut engines = vec![];
-        let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
-
-        match kind {
-            EngineKind::Afl => {
-                fs::create_dir_all(format!("{}/afl", self.output_target()))?;
-                let start = handles.len();
-                let _afl_cmds = self.spawn_afl(&cargo, jobs, &mut handles)?;
-                engines.push(EngineInfo {
-                    name: format!("AFL++ ({jobs}P)"),
-                    kind: EngineKind::Afl,
-                    process_indices: (start..handles.len()).collect(),
-                    worker_count: jobs,
-                });
-                eprintln!("    Launched AFL++ ({jobs} instances)");
-            }
-            EngineKind::Honggfuzz => {
-                let start = handles.len();
-                let hfuzz_cmd = self.spawn_honggfuzz(&cargo, jobs, &mut handles)?;
-                engines.push(EngineInfo {
-                    name: format!("honggfuzz ({jobs}T)"),
-                    kind: EngineKind::Honggfuzz,
-                    process_indices: (start..handles.len()).collect(),
-                    worker_count: jobs,
-                });
-                eprintln!("    Launched honggfuzz ({jobs} threads)");
-                eprintln!("      $ {hfuzz_cmd}");
-            }
-            EngineKind::Libfuzzer => {
-                let start = handles.len();
-                let lf_cmd = self.spawn_libfuzzer(jobs, &mut handles)?;
-                engines.push(EngineInfo {
-                    name: format!("libfuzzer ({jobs}F)"),
-                    kind: EngineKind::Libfuzzer,
-                    process_indices: (start..handles.len()).collect(),
-                    worker_count: jobs,
-                });
-                eprintln!("    Launched libfuzzer ({jobs} workers)");
-                eprintln!("      $ {lf_cmd}");
-            }
-        }
-
-        Ok((handles, engines))
-    }
 
     // ── crash collection ────────────────────────────────────────────────
 
@@ -752,94 +539,7 @@ impl Fuzz {
 
     // ── corpus sync ─────────────────────────────────────────────────────
 
-    fn sync_corpus(&self, last_synced: Option<SystemTime>) -> Result<Option<SystemTime>> {
-        let mut files = vec![];
-        if self.afl_enabled() {
-            files.extend(
-                glob(&format!(
-                    "{}/afl/mainaflfuzzer/queue/*",
-                    self.output_target()
-                ))?
-                .flatten(),
-            );
-        }
-        if self.honggfuzz_enabled() {
-            files.extend(glob(&format!("{}/honggfuzz/corpus/*", self.output_target()))?.flatten());
-        }
-        if self.libfuzzer_enabled() {
-            files.extend(glob(&format!("{}/libfuzzer/corpus/*", self.output_target()))?.flatten());
-        }
-
-        // Collect files from external corpus directories (time-filtered: only
-        // files modified since the last sync are considered, so we don't re-hash
-        // the entire external dir every cycle).
-        let external_files = self.collect_external_corpus_files(last_synced);
-
-        let mut newest_time = last_synced;
-
-        // Time-filter helper: returns true if the file was created after last_synced,
-        // and updates newest_time as a side effect.
-        let mut is_new_file = |file: &PathBuf| -> bool {
-            if let Ok(metadata) = file.metadata() {
-                if let Ok(created) = metadata.created() {
-                    if last_synced.is_none_or(|time| created > time) {
-                        if newest_time.is_none_or(|time| created > time) {
-                            newest_time = Some(created);
-                        }
-                        return true;
-                    }
-                }
-            }
-            false
-        };
-
-        let valid_files: Vec<_> = files.iter().filter(|f| is_new_file(f)).collect();
-        // External files are already time-filtered by collect_external_corpus_files,
-        // but we still need to update newest_time from them.
-        for f in &external_files {
-            is_new_file(f);
-        }
-
-        let max_len = self.max_input_size() as u64;
-
-        // Merge engine files + external files into the same dedup pipeline
-        let all_files: Vec<&PathBuf> = valid_files
-            .into_iter()
-            .chain(external_files.iter())
-            .collect();
-
-        for file in all_files {
-            if file.file_name().is_some() {
-                let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-                if file_len > max_len {
-                    continue;
-                }
-
-                // Hash-dedup into shared corpus
-                let bytes = fs::read(file).unwrap_or_default();
-                let hash = XxHash64::oneshot(0, &bytes);
-                let corpus_path = format!("{}/corpus/{hash:x}", self.output_target());
-                if Path::new(&corpus_path).exists() {
-                    continue;
-                }
-                let _ = fs::copy(file, &corpus_path);
-
-                // Copy to honggfuzz bridge queue (--dynamic_input dir).
-                // Honggfuzz unlinks files after ingesting them (~1s poll),
-                // so we only feed genuinely new files from subsequent syncs.
-                // On the first sync (last_synced is None) we skip this —
-                // honggfuzz already has the initial corpus via --input.
-                if self.honggfuzz_enabled() && last_synced.is_some() {
-                    let queue_path = format!("{}/queue/{hash:x}", self.output_target());
-                    let _ = fs::copy(file, &queue_path);
-                }
-            }
-        }
-
-        Ok(newest_time)
-    }
-
-    /// AflFirst sync: push seeds from libfuzzer/honggfuzz into AFL++ main queue.
+    /// Sync: push seeds from libfuzzer/honggfuzz into AFL++ main queue.
     /// Uses an in-memory hash set for O(1) dedup that scales to 200k+ files.
     fn sync_corpus_afl_first(
         &mut self,
@@ -992,11 +692,6 @@ impl Fuzz {
 
     // ── spawning ────────────────────────────────────────────────────────
 
-    fn spawn_fuzzers(&mut self) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
-        let (a, h, l) = self.allocate_jobs();
-        self.spawn_fuzzers_with_allocation(a, h, l)
-    }
-
     fn spawn_fuzzers_afl_first(&mut self) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
         let (a, h, l) = self.allocate_jobs_afl_first();
         self.spawn_fuzzers_with_allocation(a, h, l)
@@ -1081,48 +776,7 @@ impl Fuzz {
 
     /// Allocate jobs between AFL++, honggfuzz and libfuzzer.
     /// Returns (afl_jobs, honggfuzz_jobs, libfuzzer_jobs).
-    fn allocate_jobs(&self) -> (u32, u32, u32) {
-        let afl = self.afl_enabled();
-        let hfuzz = self.honggfuzz_enabled();
-        let libf = self.libfuzzer_enabled();
-
-        // With a single job and multiple engines, give it all to AFL (most effective solo).
-        if self.jobs() == 1 {
-            if afl {
-                return (1, 0, 0);
-            } else if hfuzz {
-                return (0, 1, 0);
-            } else {
-                return (0, 0, 1);
-            }
-        }
-
-        // Carve out libfuzzer jobs first.
-        let lf_jobs = if libf {
-            if !afl && !hfuzz {
-                self.jobs()
-            } else {
-                std::cmp::min(self.jobs().div_ceil(4), 4)
-            }
-        } else {
-            0
-        };
-        let remaining = self.jobs() - lf_jobs;
-
-        // Split remaining between AFL++ and honggfuzz.
-        let (a, h) = if !afl {
-            (0, remaining)
-        } else if !hfuzz {
-            (remaining, 0)
-        } else {
-            let hf = std::cmp::min(remaining.div_ceil(3), 4);
-            (remaining - hf, hf)
-        };
-
-        (a, h, lf_jobs)
-    }
-
-    /// AflFirst allocation: 1 libfuzzer fork, 1 honggfuzz thread, rest AFL.
+    /// Job allocation: 1 libfuzzer fork, 1 honggfuzz thread, rest AFL.
     /// With fewer than 3 jobs, satellites are silently disabled.
     fn allocate_jobs_afl_first(&self) -> (u32, u32, u32) {
         let afl = self.afl_enabled();
@@ -1577,21 +1231,6 @@ impl Fuzz {
         Ok(cmd_str)
     }
 
-    /// Spawn fuzzers for a given (switchable) strategy.
-    fn spawn_for_strategy(
-        &mut self,
-        s: Strategy,
-    ) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
-        match s {
-            Strategy::AflFirst => self.spawn_fuzzers_afl_first(),
-            Strategy::Parallel => self.spawn_fuzzers(),
-            Strategy::AflOnly => self.spawn_single_engine(EngineKind::Afl, self.jobs()),
-            Strategy::HonggOnly => self.spawn_single_engine(EngineKind::Honggfuzz, self.jobs()),
-            Strategy::LibfuzzerOnly => self.spawn_single_engine(EngineKind::Libfuzzer, self.jobs()),
-            Strategy::Sequential => unreachable!(),
-        }
-    }
-
     /// Dynamically add or remove AFL++ secondary workers.
     fn handle_scale_afl(
         &mut self,
@@ -1734,14 +1373,6 @@ impl Fuzz {
             }
         }
         Ok(())
-    }
-}
-
-fn engine_kind_name(kind: EngineKind) -> &'static str {
-    match kind {
-        EngineKind::Afl => "AFL++",
-        EngineKind::Honggfuzz => "honggfuzz",
-        EngineKind::Libfuzzer => "libfuzzer",
     }
 }
 

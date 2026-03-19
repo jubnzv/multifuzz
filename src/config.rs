@@ -16,8 +16,6 @@ pub struct FuzzConfig {
     pub output: Option<PathBuf>,
     pub timeout: Option<u32>,
     pub max_input_size: Option<u32>,
-    pub strategy: Option<String>,
-    pub duration: Option<u64>,
     pub sync_interval: Option<u64>,
     pub dictionaries: Option<Vec<PathBuf>>,
     pub external_corpus: Option<Vec<PathBuf>>,

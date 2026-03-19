@@ -10,21 +10,6 @@ use clap::{Parser, Subcommand};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-#[derive(Clone, Copy, Default, PartialEq, clap::ValueEnum)]
-pub enum Strategy {
-    #[default]
-    #[clap(name = "afl-first")]
-    AflFirst,
-    Parallel,
-    Sequential,
-    #[clap(name = "afl-only")]
-    AflOnly,
-    #[clap(name = "hongg-only")]
-    HonggOnly,
-    #[clap(name = "libfuzzer-only")]
-    LibfuzzerOnly,
-}
-
 pub const DEFAULT_OUTPUT_DIR: &str = "./output";
 pub const DEFAULT_MAX_INPUT_SIZE: u32 = 8192;
 
@@ -114,13 +99,6 @@ pub struct Fuzz {
     /// Recursively traverse external corpus directories
     #[clap(long = "external-corpus-recursive")]
     external_corpus_recursive: bool,
-    /// Execution strategy: parallel (default) runs all engines at once;
-    /// sequential runs each engine one at a time with all jobs
-    #[clap(long, value_enum)]
-    strategy: Option<Strategy>,
-    /// Total session duration in minutes (required with --strategy sequential)
-    #[clap(long = "duration", value_name = "MINS")]
-    duration: Option<u64>,
     /// Enable web dashboard (auto-refreshing HTML page)
     #[clap(long = "web", action)]
     web: bool,
@@ -133,7 +111,7 @@ pub struct Fuzz {
     /// Parsed per-worker AFL configs from TOML (not a CLI flag).
     #[clap(skip)]
     afl_worker_configs: config::AflWorkerConfigs,
-    /// In-memory hash set for AflFirst sync dedup (survives across sync cycles).
+    /// In-memory hash set for sync dedup (survives across sync cycles).
     #[clap(skip)]
     sync_hashes: HashSet<u64>,
 }
@@ -159,9 +137,6 @@ impl Fuzz {
         if self.timeout.is_none() {
             self.timeout = toml.timeout;
         }
-        if self.duration.is_none() {
-            self.duration = toml.duration;
-        }
 
         // Fields with defaults: CLI if Some, else TOML, else hardcoded default
         self.jobs = Some(self.jobs.or(toml.jobs).unwrap_or(1));
@@ -176,20 +151,6 @@ impl Fuzz {
                 .or(toml.web.as_ref().and_then(|w| w.port))
                 .unwrap_or(8080),
         );
-
-        // Strategy
-        if self.strategy.is_none() {
-            self.strategy = toml.strategy.as_deref().and_then(|s| match s {
-                "afl-first" => Some(Strategy::AflFirst),
-                "parallel" => Some(Strategy::Parallel),
-                "sequential" => Some(Strategy::Sequential),
-                "afl-only" => Some(Strategy::AflOnly),
-                "hongg-only" => Some(Strategy::HonggOnly),
-                "libfuzzer-only" => Some(Strategy::LibfuzzerOnly),
-                _ => None,
-            });
-        }
-        self.strategy = Some(self.strategy.unwrap_or(Strategy::AflFirst));
 
         // Output defaults
         if self.output.is_none() {
@@ -260,9 +221,6 @@ impl Fuzz {
     }
     pub fn web_port(&self) -> u16 {
         self.web_port.unwrap()
-    }
-    pub fn strategy(&self) -> Strategy {
-        self.strategy.unwrap()
     }
     pub fn output(&self) -> &Path {
         self.output.as_deref().unwrap()

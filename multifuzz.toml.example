@@ -6,7 +6,7 @@
 #     -- fuzz multifuzz_source_fuzzer --sync-interval 60 -j 4 \
 #     -i ../../source_corpus -o ../../output/multi \
 #     -x ../../dicts/move.dict -x ../../dicts/move_rare.dict -x ../../dicts/crash.dict \
-#     -t 10 --external-corpus /tmp/move-corpus --strategy parallel --web
+#     -t 10 --external-corpus /tmp/move-corpus --web
 #
 # With this config in place, the invocation simplifies to:
 #   AFL_SKIP_CPUFREQ=1 cargo run --release -- fuzz
@@ -17,7 +17,6 @@ jobs = 4
 corpus = "../../source_corpus"
 output = "../../output/multi"
 timeout = 10
-strategy = "parallel"
 sync_interval = 60
 dictionaries = [
     "../../dicts/move.dict",
