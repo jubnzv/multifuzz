@@ -127,9 +127,12 @@ pub struct Fuzz {
     /// Port for the web dashboard
     #[clap(long = "web-port", value_name = "PORT")]
     web_port: Option<u16>,
-    /// Parsed AFL env rules from TOML config (not a CLI flag).
+    /// Parsed AFL "all" config from TOML (not a CLI flag).
     #[clap(skip)]
-    afl_env_rules: Vec<config::AflEnvRule>,
+    afl_all_config: Option<config::AflWorkerConfig>,
+    /// Parsed per-worker AFL configs from TOML (not a CLI flag).
+    #[clap(skip)]
+    afl_worker_configs: config::AflWorkerConfigs,
     /// In-memory hash set for AflFirst sync dedup (survives across sync cycles).
     #[clap(skip)]
     sync_hashes: HashSet<u64>,
@@ -232,13 +235,15 @@ impl Fuzz {
             self.web = toml.web.as_ref().and_then(|w| w.enabled).unwrap_or(false);
         }
 
-        // AFL env rules (TOML only)
-        self.afl_env_rules = toml
+        // AFL per-worker configs (TOML only)
+        let (all_cfg, worker_cfgs) = toml
             .afl
             .as_ref()
-            .map(config::parse_afl_env_rules)
+            .map(config::parse_afl_worker_configs)
             .transpose()?
             .unwrap_or_default();
+        self.afl_all_config = all_cfg;
+        self.afl_worker_configs = worker_cfgs;
 
         Ok(())
     }

@@ -59,10 +59,23 @@ dictionaries = ["./dict.dict"]
 [fuzz.web]
 enabled = true
 
-# Per-worker AFL++ env overrides.
-# Keys: "all", "even", "odd", "workerN".
+# Per-worker AFL++ configuration. No hidden defaults — everything explicit.
+# [fuzz.afl.all.env] sets base env vars for every AFL worker.
+# [fuzz.afl.workerN]  overrides for specific worker N (0=main, 1+=secondary).
+# Worker env = all.env + workerN.env merged (worker wins on conflict).
 [fuzz.afl.all.env]
-AFL_SKIP_CPUFREQ = "1"
+AFL_AUTORESUME = "1"
+AFL_FAST_CAL = "1"
+AFL_FORCE_UI = "1"
+AFL_IGNORE_UNKNOWN_ENVS = "1"
+AFL_CMPLOG_ONLY_NEW = "1"
+AFL_DISABLE_TRIM = "1"
+AFL_NO_WARN_INSTABILITY = "1"
+AFL_FUZZER_STATS_UPDATE_INTERVAL = "10"
+AFL_IGNORE_SEED_PROBLEMS = "1"
+
+[fuzz.afl.worker0.env]
+AFL_FINAL_SYNC = "1"
 
 [fuzz.afl.worker2.env]
 AFL_CUSTOM_MUTATOR_LIBRARY = "/path/to/mutator.so"

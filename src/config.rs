@@ -1,8 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::process;
 
 #[derive(Deserialize, Default)]
 pub struct ConfigFile {
@@ -25,8 +24,8 @@ pub struct FuzzConfig {
     pub external_corpus_recursive: Option<bool>,
     pub engines: Option<EnginesConfig>,
     pub web: Option<WebConfig>,
-    /// Per-worker AFL++ env overrides. Keys: "all", "even", "odd", "workerN".
-    /// e.g. [fuzz.afl.worker2.env]
+    /// Per-worker AFL++ configuration. Keys: "all" or "workerN".
+    /// e.g. [fuzz.afl.all.env], [fuzz.afl.worker2.env]
     pub afl: Option<HashMap<String, AflWorkerConfig>>,
 }
 
@@ -43,89 +42,71 @@ pub struct WebConfig {
     pub port: Option<u16>,
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Deserialize, Default)]
 pub struct AflWorkerConfig {
+    /// Full command override. When set, replaces all auto-generated args.
+    /// Executed via `sh -c`.
+    pub command: Option<String>,
+    /// Env vars for this worker (or all workers if key is "all").
     pub env: Option<HashMap<String, String>>,
 }
 
-// ── Selector ────────────────────────────────────────────────────────────
+/// Parsed AFL worker configs: the "all" config + per-worker configs.
+pub type AflWorkerConfigs = HashMap<u32, AflWorkerConfig>;
 
-#[derive(Clone, Debug)]
-pub enum WorkerSelector {
-    All,
-    Even,
-    Odd,
-    Single(u32),
-}
-
-impl WorkerSelector {
-    /// Parse a TOML key like "all", "even", "odd", "worker2".
-    fn from_key(key: &str) -> Result<Self> {
-        match key {
-            "all" => Ok(Self::All),
-            "even" => Ok(Self::Even),
-            "odd" => Ok(Self::Odd),
+/// Parse the `[fuzz.afl.*]` map into (all_config, per_worker_configs).
+///
+/// Accepts "all" and "workerN" keys. Rejects "even"/"odd".
+pub fn parse_afl_worker_configs(
+    afl: &HashMap<String, AflWorkerConfig>,
+) -> Result<(Option<AflWorkerConfig>, AflWorkerConfigs)> {
+    let mut all_config = None;
+    let mut workers = HashMap::new();
+    for (key, config) in afl {
+        match key.as_str() {
+            "all" => {
+                all_config = Some(config.clone());
+            }
+            "even" | "odd" => {
+                return Err(anyhow!(
+                    "AFL config key '{key}' is no longer supported. \
+                     Use 'all' or per-worker keys: [fuzz.afl.worker0], [fuzz.afl.worker1], etc."
+                ));
+            }
             _ => {
                 let n = key
                     .strip_prefix("worker")
                     .ok_or_else(|| {
                         anyhow!(
-                            "unknown AFL worker key: '{key}' \
-                             (expected 'all', 'even', 'odd', or 'workerN')"
+                            "unknown AFL config key: '{key}' (expected 'all' or 'workerN')"
                         )
                     })?
                     .parse::<u32>()
                     .with_context(|| format!("invalid worker number in key: '{key}'"))?;
-                Ok(Self::Single(n))
+                workers.insert(n, config.clone());
             }
         }
     }
-
-    pub fn matches(&self, job_num: u32) -> bool {
-        match self {
-            Self::All => true,
-            Self::Even => job_num.is_multiple_of(2),
-            Self::Odd => job_num % 2 == 1,
-            Self::Single(n) => job_num == *n,
-        }
-    }
+    Ok((all_config, workers))
 }
 
-#[derive(Clone, Debug)]
-pub struct AflEnvRule {
-    pub key: String,
-    pub value: String,
-    pub selector: WorkerSelector,
-}
-
-/// Parse the `[fuzz.afl.*]` map into a flat vec of env rules.
-pub fn parse_afl_env_rules(afl: &HashMap<String, AflWorkerConfig>) -> Result<Vec<AflEnvRule>> {
-    let mut rules = Vec::new();
-    for (worker_key, config) in afl {
-        let selector = WorkerSelector::from_key(worker_key)?;
-        if let Some(env) = &config.env {
-            for (k, v) in env {
-                rules.push(AflEnvRule {
-                    key: k.clone(),
-                    value: v.clone(),
-                    selector: selector.clone(),
-                });
-            }
+/// Merge `all.env` + `workerN.env` into a sorted map. Worker-specific values win on conflict.
+pub fn resolve_afl_env(
+    all: &Option<AflWorkerConfig>,
+    worker: Option<&AflWorkerConfig>,
+) -> BTreeMap<String, String> {
+    let mut env = BTreeMap::new();
+    if let Some(all_cfg) = all {
+        if let Some(all_env) = &all_cfg.env {
+            env.extend(all_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
     }
-    Ok(rules)
-}
-
-/// Apply matching AFL env rules to a [`process::Command`].
-pub fn apply_afl_env_rules(cmd: &mut process::Command, job_num: u32, rules: &[AflEnvRule]) {
-    for rule in rules {
-        if rule.selector.matches(job_num) {
-            cmd.env(&rule.key, &rule.value);
-            if rule.key == "AFL_TMPDIR" {
-                let _ = std::fs::create_dir_all(&rule.value);
-            }
+    if let Some(w_cfg) = worker {
+        if let Some(w_env) = &w_cfg.env {
+            env.extend(w_env.iter().map(|(k, v)| (k.clone(), v.clone())));
         }
     }
+    env
 }
 
 /// Load config from explicit path, `./multifuzz.toml`, or return default.

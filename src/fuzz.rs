@@ -3,7 +3,7 @@ use crate::{config, web, Build, Fuzz, Strategy};
 use anyhow::{anyhow, Context, Result};
 use glob::glob;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     env, fs,
     fs::File,
     io::{BufRead, BufReader, Write},
@@ -21,17 +21,15 @@ use std::{
 struct AflWorkerConfig {
     power_schedule: &'static str,
     cmplog_level: Option<&'static str>,
-    mopt: bool,
     old_queue: bool,
 }
 
 /// Compute AFL++ flags for a secondary worker based on total worker count.
 ///
-/// Distributes power schedules, cmplog, MOPT, and old-queue evenly:
+/// Distributes power schedules, cmplog, and old-queue evenly:
 /// - Power schedules rotate through all available modes.
 /// - Cmplog on ~20% of workers (min 1 if workers >= 3), varying `-l` levels.
-/// - MOPT (`-L0`) on ~10% of workers (min 1 if workers >= 5).
-/// - Old queue (`-Z`) on ~10% of workers (min 1 if workers >= 5), no overlap with MOPT.
+/// - Old queue (`-Z`) on ~10% of workers (min 1 if workers >= 5).
 fn afl_worker_config(job_num: u32, total_secondaries: u32) -> AflWorkerConfig {
     const SCHEDULES: &[&str] = &[
         "explore", "fast", "coe", "exploit", "rare", "mmopt", "seek", "lin", "quad",
@@ -51,24 +49,30 @@ fn afl_worker_config(job_num: u32, total_secondaries: u32) -> AflWorkerConfig {
         None
     };
 
-    // MOPT: ~10% of workers, at least 1 when >= 5 secondaries.
-    // Placed after cmplog workers to avoid overlap.
-    let mopt_count = if n >= 5 { (n / 10).max(1) } else { 0 };
-    let mopt_start = cmplog_count;
-    let mopt = idx >= mopt_start && idx < mopt_start + mopt_count;
-
     // Old queue: ~10% of workers, at least 1 when >= 5 secondaries.
-    // Placed after MOPT workers to avoid overlap.
     let old_queue_count = if n >= 5 { (n / 10).max(1) } else { 0 };
-    let old_queue_start = mopt_start + mopt_count;
+    let old_queue_start = cmplog_count;
     let old_queue = idx >= old_queue_start && idx < old_queue_start + old_queue_count;
 
     AflWorkerConfig {
         power_schedule,
         cmplog_level,
-        mopt,
         old_queue,
     }
+}
+
+/// Print per-worker AFL configuration to stderr.
+fn log_afl_worker(job_num: u32, label: &str, env_vars: &BTreeMap<String, String>, cmd: &str) {
+    eprintln!("    -- AFL worker {job_num} ({label}) --");
+    if env_vars.is_empty() {
+        eprintln!("    (no env vars configured)");
+    } else {
+        for (k, v) in env_vars {
+            eprintln!("    env {k}={v}");
+        }
+    }
+    eprintln!("    $ {cmd}");
+    eprintln!();
 }
 
 /// Recursively collect all directories under `dir`.
@@ -645,7 +649,7 @@ impl Fuzz {
             EngineKind::Afl => {
                 fs::create_dir_all(format!("{}/afl", self.output_target()))?;
                 let start = handles.len();
-                let afl_cmds = self.spawn_afl(&cargo, jobs, &mut handles)?;
+                let _afl_cmds = self.spawn_afl(&cargo, jobs, &mut handles)?;
                 engines.push(EngineInfo {
                     name: format!("AFL++ ({jobs}P)"),
                     kind: EngineKind::Afl,
@@ -653,9 +657,6 @@ impl Fuzz {
                     worker_count: jobs,
                 });
                 eprintln!("    Launched AFL++ ({jobs} instances)");
-                for cmd in &afl_cmds {
-                    eprintln!("      $ {cmd}");
-                }
             }
             EngineKind::Honggfuzz => {
                 let start = handles.len();
@@ -1018,7 +1019,7 @@ impl Fuzz {
         if afl_jobs > 0 {
             fs::create_dir_all(format!("{}/afl", self.output_target()))?;
             let start = handles.len();
-            let afl_cmds = self.spawn_afl(&cargo, afl_jobs, &mut handles)?;
+            let _afl_cmds = self.spawn_afl(&cargo, afl_jobs, &mut handles)?;
             engines.push(EngineInfo {
                 name: format!("AFL++ ({afl_jobs}P)"),
                 kind: EngineKind::Afl,
@@ -1026,9 +1027,6 @@ impl Fuzz {
                 worker_count: afl_jobs,
             });
             eprintln!("    Launched AFL++ ({afl_jobs} instances)");
-            for cmd in &afl_cmds {
-                eprintln!("      $ {cmd}");
-            }
         }
 
         if honggfuzz_jobs > 0 {
@@ -1200,6 +1198,13 @@ impl Fuzz {
 
     /// Spawn a single AFL++ secondary instance.  Returns (child, command_string).
     fn spawn_afl_secondary(&self, cargo: &str, job_num: u32) -> Result<(process::Child, String)> {
+        let worker_cfg = self.afl_worker_configs.get(&job_num);
+
+        // Custom command: delegate to sh -c.
+        if let Some(command) = worker_cfg.and_then(|c| c.command.as_deref()) {
+            return self.spawn_afl_custom(job_num, command);
+        }
+
         let total_secondaries = self.next_afl_job_num.max(job_num + 1) - 1;
         let wc = afl_worker_config(job_num, total_secondaries);
 
@@ -1207,13 +1212,11 @@ impl Fuzz {
         let dict_flags = self.afl_dict_flags();
 
         let fuzzer_name = format!("-Ssecondaryfuzzer{job_num}");
-        let power_schedule = wc.power_schedule;
-        let mopt = if wc.mopt { "-L0" } else { "" };
-        let old_queue = if wc.old_queue { "-Z" } else { "" };
+        let old_queue_flag = if wc.old_queue { "-Z" } else { "" };
 
-        let target_path_str = format!("./target/afl/debug/{}", self.target());
+        let target_path = format!("./target/afl/debug/{}", self.target());
         let cmplog_flags: Vec<String> = match wc.cmplog_level {
-            Some(level) => vec![format!("-c{target_path_str}"), level.to_string()],
+            Some(level) => vec![format!("-c{target_path}"), level.to_string()],
             None => vec![],
         };
 
@@ -1230,17 +1233,14 @@ impl Fuzz {
                 .into()
         };
 
-        let target_path = format!("./target/afl/debug/{}", self.target());
-
         let afl_args: Vec<String> = [
             "afl".to_string(),
             "fuzz".to_string(),
             fuzzer_name,
             format!("-i{afl_input_dir}"),
-            format!("-p{power_schedule}"),
+            format!("-p{}", wc.power_schedule),
             format!("-o{}/afl", self.output_target()),
-            old_queue.to_string(),
-            mopt.to_string(),
+            old_queue_flag.to_string(),
             timeout_flag,
             max_len_flag,
         ]
@@ -1249,41 +1249,70 @@ impl Fuzz {
         .chain(cmplog_flags.iter().cloned())
         .collect();
 
+        // Resolve env: all config + worker config merged, no hardcoded defaults.
+        let env_vars = config::resolve_afl_env(&self.afl_all_config, worker_cfg);
+        for (k, v) in &env_vars {
+            if k == "AFL_TMPDIR" {
+                let _ = std::fs::create_dir_all(v);
+            }
+        }
+
         let mut cmd = process::Command::new(cargo);
         cmd.args(&afl_args)
             .args(&dict_flags)
             .arg(&target_path)
-            .env("AFL_AUTORESUME", "1")
-            .env("AFL_FAST_CAL", "1")
-            .env("AFL_FORCE_UI", "1")
-            .env("AFL_IGNORE_UNKNOWN_ENVS", "1")
-            .env("AFL_CMPLOG_ONLY_NEW", "1")
-            .env("AFL_DISABLE_TRIM", "1")
-            .env("AFL_NO_WARN_INSTABILITY", "1")
-            .env("AFL_FUZZER_STATS_UPDATE_INTERVAL", "10")
-            .env("_DUMMY_VAR", "1")
-            .env("AFL_IGNORE_SEED_PROBLEMS", "1")
             .stdout(log_destination())
             .stderr(log_destination())
             .process_group(0);
+        for (k, v) in &env_vars {
+            cmd.env(k, v);
+        }
 
-        // Apply per-worker AFL env rules from TOML config.
-        config::apply_afl_env_rules(&mut cmd, job_num, &self.afl_env_rules);
+        // Build display strings.
+        let mut cmd_parts: Vec<&str> = vec![cargo];
+        cmd_parts.extend(afl_args.iter().map(|s| s.as_str()));
+        cmd_parts.extend(dict_flags.iter().map(|s| s.as_str()));
+        cmd_parts.push(&target_path);
+        let cmd_str = cmd_parts.join(" ");
+        log_afl_worker(job_num, "secondary", &env_vars, &cmd_str);
 
-        let mut env_prefix = String::from("AFL_AUTORESUME=1 AFL_FAST_CAL=1");
-        for rule in &self.afl_env_rules {
-            if rule.selector.matches(job_num) {
-                env_prefix.push_str(&format!(" {}={}", rule.key, rule.value));
+        Ok((cmd.spawn()?, cmd_str))
+    }
+
+    /// Spawn an AFL++ worker with a custom command (sh -c).
+    fn spawn_afl_custom(&self, job_num: u32, command: &str) -> Result<(process::Child, String)> {
+        let log_name = if job_num == 0 {
+            "afl.log".to_string()
+        } else {
+            format!("afl_{job_num}.log")
+        };
+        let log_destination = || -> Stdio {
+            File::create(format!("{}/logs/{log_name}", self.output_target()))
+                .unwrap()
+                .into()
+        };
+
+        let worker_cfg = self.afl_worker_configs.get(&job_num);
+        let env_vars = config::resolve_afl_env(&self.afl_all_config, worker_cfg);
+        for (k, v) in &env_vars {
+            if k == "AFL_TMPDIR" {
+                let _ = std::fs::create_dir_all(v);
             }
         }
-        let cmd_str = format!(
-            "{} {} {} {}",
-            env_prefix,
-            cargo,
-            afl_args.join(" "),
-            target_path,
-        );
-        Ok((cmd.spawn()?, cmd_str))
+
+        let mut cmd = process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(command)
+            .stdout(log_destination())
+            .stderr(log_destination())
+            .process_group(0);
+        for (k, v) in &env_vars {
+            cmd.env(k, v);
+        }
+
+        log_afl_worker(job_num, "custom", &env_vars, command);
+
+        Ok((cmd.spawn()?, command.to_string()))
     }
 
     fn spawn_afl(
@@ -1300,93 +1329,100 @@ impl Fuzz {
         // Set next_afl_job_num early so spawn_afl_secondary sees total count.
         self.next_afl_job_num = afl_jobs;
 
-        // Spawn main instance (job_num=0) — unique -M flag, -F sync flags, AFL_FINAL_SYNC
+        // Spawn main instance (job_num=0) — unique -M flag, -F sync flags.
         {
             let job_num: u32 = 0;
-            let fuzzer_name = String::from("-Mmainaflfuzzer");
+            let worker_cfg = self.afl_worker_configs.get(&job_num);
 
-            let honggfuzz_sync_flag = if self.honggfuzz_enabled() {
-                format!("-F{}/honggfuzz/corpus", self.output_target())
+            // Custom command: delegate to sh -c.
+            if let Some(command) = worker_cfg.and_then(|c| c.command.as_deref()) {
+                let (child, cmd_str) = self.spawn_afl_custom(job_num, command)?;
+                cmds.push(cmd_str.clone());
+                handles.push(Some(ProcessSlot {
+                    child,
+                    paused: false,
+                    job_num: Some(0),
+                    command: Some(cmd_str),
+                }));
             } else {
-                String::new()
-            };
-            let libfuzzer_sync_flag = if self.libfuzzer_enabled() {
-                format!("-F{}/libfuzzer/corpus", self.output_target())
-            } else {
-                String::new()
-            };
+                let fuzzer_name = String::from("-Mmainaflfuzzer");
 
-            let power_schedule = "explore";
-            let timeout_flag = match self.timeout {
-                Some(t) => format!("-t{}", t * 1000),
-                None => String::new(),
-            };
-            let max_len_flag = format!("-G{}", self.max_input_size());
+                let honggfuzz_sync_flag = if self.honggfuzz_enabled() {
+                    format!("-F{}/honggfuzz/corpus", self.output_target())
+                } else {
+                    String::new()
+                };
+                let libfuzzer_sync_flag = if self.libfuzzer_enabled() {
+                    format!("-F{}/libfuzzer/corpus", self.output_target())
+                } else {
+                    String::new()
+                };
 
-            let log_destination = || -> Stdio {
-                File::create(format!("{}/logs/afl.log", self.output_target()))
-                    .unwrap()
-                    .into()
-            };
+                let power_schedule = "explore";
+                let timeout_flag = match self.timeout {
+                    Some(t) => format!("-t{}", t * 1000),
+                    None => String::new(),
+                };
+                let max_len_flag = format!("-G{}", self.max_input_size());
 
-            let target_path = format!("./target/afl/debug/{}", self.target());
+                let log_destination = || -> Stdio {
+                    File::create(format!("{}/logs/afl.log", self.output_target()))
+                        .unwrap()
+                        .into()
+                };
 
-            let afl_args: Vec<String> = [
-                "afl".to_string(),
-                "fuzz".to_string(),
-                fuzzer_name.clone(),
-                format!("-i{afl_input_dir}"),
-                format!("-p{power_schedule}"),
-                format!("-o{}/afl", self.output_target()),
-                honggfuzz_sync_flag.clone(),
-                libfuzzer_sync_flag.clone(),
-                timeout_flag.clone(),
-                max_len_flag.clone(),
-            ]
-            .into_iter()
-            .filter(|a| !a.is_empty())
-            .collect();
+                let target_path = format!("./target/afl/debug/{}", self.target());
 
-            let mut env_prefix = String::from("AFL_AUTORESUME=1 AFL_FAST_CAL=1 AFL_FINAL_SYNC=1");
-            for rule in &self.afl_env_rules {
-                if rule.selector.matches(job_num) {
-                    env_prefix.push_str(&format!(" {}={}", rule.key, rule.value));
+                let afl_args: Vec<String> = [
+                    "afl".to_string(),
+                    "fuzz".to_string(),
+                    fuzzer_name.clone(),
+                    format!("-i{afl_input_dir}"),
+                    format!("-p{power_schedule}"),
+                    format!("-o{}/afl", self.output_target()),
+                    honggfuzz_sync_flag.clone(),
+                    libfuzzer_sync_flag.clone(),
+                    timeout_flag.clone(),
+                    max_len_flag.clone(),
+                ]
+                .into_iter()
+                .filter(|a| !a.is_empty())
+                .collect();
+
+                // Resolve env: all config + worker config merged, no hardcoded defaults.
+                let env_vars = config::resolve_afl_env(&self.afl_all_config, worker_cfg);
+                for (k, v) in &env_vars {
+                    if k == "AFL_TMPDIR" {
+                        let _ = std::fs::create_dir_all(v);
+                    }
                 }
+
+                let mut cmd_parts: Vec<&str> = vec![cargo];
+                cmd_parts.extend(afl_args.iter().map(|s| s.as_str()));
+                cmd_parts.extend(dict_flags.iter().map(|s| s.as_str()));
+                cmd_parts.push(&target_path);
+                let main_cmd_str = cmd_parts.join(" ");
+                cmds.push(main_cmd_str.clone());
+                log_afl_worker(job_num, "main", &env_vars, &main_cmd_str);
+
+                let mut cmd = process::Command::new(cargo);
+                cmd.args(&afl_args)
+                    .args(&dict_flags)
+                    .arg(&target_path)
+                    .stdout(log_destination())
+                    .stderr(log_destination())
+                    .process_group(0);
+                for (k, v) in &env_vars {
+                    cmd.env(k, v);
+                }
+
+                handles.push(Some(ProcessSlot {
+                    child: cmd.spawn()?,
+                    paused: false,
+                    job_num: Some(0),
+                    command: Some(main_cmd_str),
+                }));
             }
-            let mut cmd_parts: Vec<String> = Vec::new();
-            cmd_parts.push(env_prefix);
-            cmd_parts.push(cargo.to_string());
-            cmd_parts.extend(afl_args.iter().cloned());
-            cmd_parts.extend(dict_flags.iter().cloned());
-            cmd_parts.push(target_path.clone());
-            let main_cmd_str = cmd_parts.join(" ");
-            cmds.push(main_cmd_str.clone());
-
-            let mut cmd = process::Command::new(cargo);
-            cmd.args(&afl_args)
-                .args(&dict_flags)
-                .arg(&target_path)
-                .env("AFL_AUTORESUME", "1")
-                .env("AFL_FAST_CAL", "1")
-                .env("AFL_FORCE_UI", "1")
-                .env("AFL_IGNORE_UNKNOWN_ENVS", "1")
-                .env("AFL_CMPLOG_ONLY_NEW", "1")
-                .env("AFL_DISABLE_TRIM", "1")
-                .env("AFL_NO_WARN_INSTABILITY", "1")
-                .env("AFL_FUZZER_STATS_UPDATE_INTERVAL", "10")
-                .env("AFL_FINAL_SYNC", "1")
-                .env("AFL_IGNORE_SEED_PROBLEMS", "1")
-                .stdout(log_destination())
-                .stderr(log_destination())
-                .process_group(0);
-            config::apply_afl_env_rules(&mut cmd, job_num, &self.afl_env_rules);
-
-            handles.push(Some(ProcessSlot {
-                child: cmd.spawn()?,
-                paused: false,
-                job_num: Some(0),
-                command: Some(main_cmd_str),
-            }));
         }
 
         // Spawn secondaries (job_num 1..afl_jobs)

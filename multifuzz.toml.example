@@ -29,13 +29,42 @@ external_corpus = ["/tmp/move-corpus"]
 [fuzz.web]
 enabled = true
 
-# Per-worker AFL++ env overrides.
-# Keys: "all", "even", "odd", "workerN".
-# Applied AFTER hardcoded defaults, so they override them.
+# Per-worker AFL++ configuration.
+# NO hardcoded env defaults — everything is explicit in the config.
+#
+# [fuzz.afl.all.env]   — base env vars applied to EVERY AFL worker.
+# [fuzz.afl.workerN]   — per-worker overrides (0=main, 1+=secondary).
+#
+# Worker env = all.env merged with workerN.env (worker wins on conflict).
+# At startup, the resolved env + command is printed per worker.
+#
+# Optional per-worker fields:
+#   command = "..."  # Full command override (executed via sh -c)
 
+[fuzz.afl.all.env]
+AFL_AUTORESUME = "1"
+AFL_FAST_CAL = "1"
+AFL_FORCE_UI = "1"
+AFL_IGNORE_UNKNOWN_ENVS = "1"
+AFL_CMPLOG_ONLY_NEW = "1"
+AFL_DISABLE_TRIM = "1"
+AFL_NO_WARN_INSTABILITY = "1"
+AFL_FUZZER_STATS_UPDATE_INTERVAL = "10"
+AFL_IGNORE_SEED_PROBLEMS = "1"
+
+# Main instance: needs AFL_FINAL_SYNC.
+[fuzz.afl.worker0.env]
+AFL_FINAL_SYNC = "1"
+
+# Secondary with custom mutator.
 [fuzz.afl.worker1.env]
 AFL_CUSTOM_MUTATOR_LIBRARY = "~/Sources/AFLplusplus/custom_mutators/radamsa/radamsa-mutator.so"
 AFL_CUSTOM_MUTATOR_ONLY = "1"
 
+# Secondary with grammar mutator.
 [fuzz.afl.worker3.env]
 AFL_CUSTOM_MUTATOR_LIBRARY = "~/Sources/AFLplusplus/custom_mutators/grammar_mutator/grammar_mutator.so"
+
+# Fully custom command example (uncomment to use):
+# [fuzz.afl.worker3]
+# command = "cargo afl fuzz -Sgrammar -i ../../source_corpus -o ../../output/multi/afl -G8192 ./target/afl/debug/multifuzz_source_fuzzer"
