@@ -28,18 +28,6 @@ fn log_afl_worker(job_num: u32, label: &str, env_vars: &BTreeMap<String, String>
     eprintln!();
 }
 
-/// Recursively collect all directories under `dir`.
-fn collect_dirs_recursively(dir: &Path, dir_list: &mut HashSet<PathBuf>) {
-    if let Ok(entries) = fs::read_dir(dir) {
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() && dir_list.insert(path.clone()) {
-                collect_dirs_recursively(&path, dir_list);
-            }
-        }
-    }
-}
-
 static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigint(_: libc::c_int) {
@@ -47,7 +35,6 @@ extern "C" fn handle_sigint(_: libc::c_int) {
 }
 
 use std::os::unix::process::CommandExt;
-use twox_hash::XxHash64;
 
 /// Merge multiple dictionary files into one, deduplicating token lines.
 fn merge_dicts(dicts: &[PathBuf], output_dir: &str) -> Result<PathBuf> {
@@ -259,7 +246,7 @@ impl Fuzz {
 
             // ── corpus sync (every N minutes) ───────────────────────────
             if last_sync_time.elapsed().as_secs() > self.sync_interval() * 60 {
-                let sync_result = self.sync_corpus_afl_first(last_synced_created_time);
+                let sync_result = self.sync_corpus(last_synced_created_time);
                 match sync_result {
                     Ok(t) => last_synced_created_time = t,
                     Err(e) => {
@@ -352,155 +339,87 @@ impl Fuzz {
 
     // ── corpus sync ─────────────────────────────────────────────────────
 
-    /// Sync: push seeds from libfuzzer/honggfuzz into AFL++ main queue.
-    /// Uses an in-memory hash set for O(1) dedup that scales to 200k+ files.
-    fn sync_corpus_afl_first(
-        &mut self,
-        last_synced: Option<SystemTime>,
-    ) -> Result<Option<SystemTime>> {
-        let afl_queue = format!("{}/afl/mainaflfuzzer/queue", self.output_target());
-        if !Path::new(&afl_queue).exists() {
-            return Ok(last_synced);
-        }
-
-        // First call: build the hash set from existing AFL queue contents.
-        if self.sync_hashes.is_empty() {
-            if let Ok(entries) = fs::read_dir(&afl_queue) {
-                for entry in entries.flatten() {
-                    let path = entry.path();
-                    if path.is_file() {
-                        if let Ok(bytes) = fs::read(&path) {
-                            let hash = XxHash64::oneshot(0, &bytes);
-                            self.sync_hashes.insert(hash);
-                        }
-                    }
-                }
-            }
-        }
-
-        // Collect new files from satellites only (no AFL, no cross-satellite sync).
-        let mut source_files: Vec<PathBuf> = vec![];
-        if self.honggfuzz_enabled() {
-            source_files
-                .extend(glob(&format!("{}/honggfuzz/corpus/*", self.output_target()))?.flatten());
-        }
-        if self.libfuzzer_enabled() {
-            source_files
-                .extend(glob(&format!("{}/libfuzzer/corpus/*", self.output_target()))?.flatten());
-        }
-
-        let external_files = self.collect_external_corpus_files(last_synced);
-
-        let mut newest_time = last_synced;
+    fn sync_corpus(&mut self, last_synced: Option<SystemTime>) -> Result<Option<SystemTime>> {
         let max_len = self.max_input_size() as u64;
+        let mut newest = last_synced;
 
-        // Time-filter source files.
-        let mut is_new_file = |file: &PathBuf| -> bool {
-            if let Ok(metadata) = file.metadata() {
-                if let Ok(created) = metadata.created() {
-                    if last_synced.is_none_or(|time| created > time) {
-                        if newest_time.is_none_or(|time| created > time) {
-                            newest_time = Some(created);
-                        }
-                        return true;
-                    }
-                }
-            }
-            false
-        };
+        // Build source lists per engine.
+        let afl_queue: PathBuf = format!("{}/afl/mainaflfuzzer/queue", self.output_target()).into();
+        let hongg_corpus: PathBuf = format!("{}/honggfuzz/corpus", self.output_target()).into();
+        let hongg_input: PathBuf = format!("{}/queue", self.output_target()).into();
+        let lf_corpus: PathBuf = format!("{}/libfuzzer/corpus", self.output_target()).into();
 
-        let valid_files: Vec<_> = source_files.iter().filter(|f| is_new_file(f)).collect();
-        for f in &external_files {
-            is_new_file(f);
-        }
+        let external: Vec<PathBuf> = crate::sync::collect_external_files(
+            &self.external_corpus,
+            self.external_corpus_recursive,
+            last_synced,
+        )
+        .iter()
+        .map(|p| p.parent().unwrap_or(Path::new(".")).to_path_buf())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
 
-        let all_files: Vec<&PathBuf> = valid_files
-            .into_iter()
-            .chain(external_files.iter())
-            .collect();
-
-        for file in all_files {
-            if !file.is_file() {
-                continue;
-            }
-            let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
-            if file_len > max_len || file_len == 0 {
-                continue;
-            }
-
-            let bytes = match fs::read(file) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let hash = XxHash64::oneshot(0, &bytes);
-
-            if self.sync_hashes.contains(&hash) {
-                continue;
-            }
-
-            // Atomic write: temp file then rename.
-            let tmp_path = format!("{afl_queue}/.sync_tmp_{hash:x}");
-            let dest_path = format!("{afl_queue}/sync_ext_{hash:x}");
-            if Path::new(&dest_path).exists() {
-                self.sync_hashes.insert(hash);
-                continue;
-            }
-            if fs::write(&tmp_path, &bytes).is_ok() {
-                let _ = fs::rename(&tmp_path, &dest_path);
-            }
-            self.sync_hashes.insert(hash);
-        }
-
-        Ok(newest_time)
-    }
-
-    /// Collect files from `--external-corpus` directories.
-    ///
-    /// Only files modified after `since` are returned, so we avoid re-scanning
-    /// and re-hashing the entire external directory on every sync cycle.
-    /// On the first sync (`since` is `None`), all files are returned.
-    fn collect_external_corpus_files(&self, since: Option<SystemTime>) -> Vec<PathBuf> {
-        if self.external_corpus.is_empty() {
-            return vec![];
-        }
-
-        let mut dirs: Vec<PathBuf> = self.external_corpus.clone();
-
-        if self.external_corpus_recursive {
-            let mut all_dirs = HashSet::new();
-            for dir in &self.external_corpus {
-                all_dirs.insert(dir.clone());
-                collect_dirs_recursively(dir, &mut all_dirs);
-            }
-            for dir in all_dirs {
-                if !dirs.contains(&dir) {
-                    dirs.push(dir);
+        // 1. External → AFL queue (hongg/libfuzzer→AFL is handled by -F).
+        if self.afl_enabled() && !self.external_corpus.is_empty() {
+            let mut sources = external.clone();
+            // Deduplicate source dirs.
+            sources.sort();
+            sources.dedup();
+            if let Ok(t) = crate::sync::sync_files(
+                &sources,
+                &afl_queue,
+                last_synced,
+                max_len,
+                &mut self.sync_hashes,
+            ) {
+                if t.is_some() {
+                    newest = t;
                 }
             }
         }
 
-        dirs.iter()
-            .flat_map(|path| {
-                if path.is_dir() {
-                    fs::read_dir(path)
-                        .into_iter()
-                        .flatten()
-                        .filter_map(|e| e.ok())
-                        .map(|e| e.path())
-                        .filter(|p| p.is_file())
-                        .collect::<Vec<_>>()
-                } else {
-                    vec![path.clone()]
+        // 2. AFL + libfuzzer + external → honggfuzz dynamic_input.
+        if self.honggfuzz_enabled() {
+            let mut sources = vec![afl_queue.clone()];
+            if self.libfuzzer_enabled() {
+                sources.push(lf_corpus.clone());
+            }
+            sources.extend(external.iter().cloned());
+            if let Ok(t) = crate::sync::sync_files(
+                &sources,
+                &hongg_input,
+                last_synced,
+                max_len,
+                &mut self.sync_hashes,
+            ) {
+                if t.is_some() {
+                    newest = t;
                 }
-            })
-            .filter(|p| {
-                since.is_none_or(|t| {
-                    p.metadata()
-                        .and_then(|m| m.modified())
-                        .is_ok_and(|mt| mt > t)
-                })
-            })
-            .collect()
+            }
+        }
+
+        // 3. AFL + honggfuzz + external → libfuzzer corpus.
+        if self.libfuzzer_enabled() {
+            let mut sources = vec![afl_queue.clone()];
+            if self.honggfuzz_enabled() {
+                sources.push(hongg_corpus.clone());
+            }
+            sources.extend(external.iter().cloned());
+            if let Ok(t) = crate::sync::sync_files(
+                &sources,
+                &lf_corpus,
+                last_synced,
+                max_len,
+                &mut self.sync_hashes,
+            ) {
+                if t.is_some() {
+                    newest = t;
+                }
+            }
+        }
+
+        Ok(newest)
     }
 
     // ── spawning ────────────────────────────────────────────────────────

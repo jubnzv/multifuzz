@@ -2,6 +2,7 @@ mod build;
 mod config;
 mod fuzz;
 mod run;
+mod sync;
 mod ui;
 
 use anyhow::{Context, Result};
