@@ -72,9 +72,7 @@ pub fn parse_afl_worker_configs(
                 let n = key
                     .strip_prefix("worker")
                     .ok_or_else(|| {
-                        anyhow!(
-                            "unknown AFL config key: '{key}' (expected 'all' or 'workerN')"
-                        )
+                        anyhow!("unknown AFL config key: '{key}' (expected 'all' or 'workerN')")
                     })?
                     .parse::<u32>()
                     .with_context(|| format!("invalid worker number in key: '{key}'"))?;

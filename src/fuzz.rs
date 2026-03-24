@@ -146,7 +146,7 @@ impl Fuzz {
 
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
-            sa.sa_sigaction = handle_sigint as libc::sighandler_t;
+            sa.sa_sigaction = handle_sigint as *const () as libc::sighandler_t;
             libc::sigemptyset(&mut sa.sa_mask);
             sa.sa_flags = 0;
             libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
@@ -271,8 +271,6 @@ impl Fuzz {
         Ok(())
     }
 
-
-
     // ── crash collection ────────────────────────────────────────────────
 
     fn collect_crashes(&self, crash_path: &Path) -> Result<()> {
@@ -345,7 +343,8 @@ impl Fuzz {
         // Build source lists per engine.
         let afl_queue: PathBuf = format!("{}/afl/mainaflfuzzer/queue", self.output_target()).into();
         let hongg_corpus: PathBuf = format!("{}/honggfuzz/corpus", self.output_target()).into();
-        let hongg_input: PathBuf = format!("{}/honggfuzz/dynamic_input", self.output_target()).into();
+        let hongg_input: PathBuf =
+            format!("{}/honggfuzz/dynamic_input", self.output_target()).into();
         let lf_corpus: PathBuf = format!("{}/libfuzzer/corpus", self.output_target()).into();
 
         let external: Vec<PathBuf> = crate::sync::collect_external_files(
@@ -784,9 +783,7 @@ impl Fuzz {
             format!("-w{}", self.merged_dict.as_ref().unwrap().display())
         };
 
-        let extra_args = worker_cfg
-            .and_then(|c| c.args.as_deref())
-            .unwrap_or("");
+        let extra_args = worker_cfg.and_then(|c| c.args.as_deref()).unwrap_or("");
 
         // The `script` invocation is a trick to get the correct TTY output for
         // honggfuzz (it requires a valid terminal).
@@ -809,7 +806,10 @@ impl Fuzz {
             "HFUZZ_BUILD_ARGS".to_string(),
             "--features=multifuzz/honggfuzz".to_string(),
         );
-        env_vars.insert("CARGO_TARGET_DIR".to_string(), "./target/honggfuzz".to_string());
+        env_vars.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            "./target/honggfuzz".to_string(),
+        );
         env_vars.insert("HFUZZ_WORKSPACE".to_string(), hfuzz_workspace.clone());
         env_vars.insert("HFUZZ_RUN_ARGS".to_string(), hfuzz_run_args.clone());
         if let Some(user_env) = worker_cfg.and_then(|c| c.env.as_ref()) {
@@ -848,10 +848,7 @@ impl Fuzz {
         Ok(cmd_str)
     }
 
-    fn spawn_libfuzzer(
-        &self,
-        handles: &mut Vec<Option<process::Child>>,
-    ) -> Result<String> {
+    fn spawn_libfuzzer(&self, handles: &mut Vec<Option<process::Child>>) -> Result<String> {
         let worker_cfg = self.libfuzzer_config.as_ref();
 
         // The libfuzzer binary is built with --target=<triple> to isolate
@@ -913,10 +910,9 @@ impl Fuzz {
             cmd.env(k, v);
         }
 
-        handles.push(Some(
-            cmd.spawn()
-                .with_context(|| format!("Failed to spawn libfuzzer binary: {binary}"))?,
-        ));
+        handles.push(Some(cmd.spawn().with_context(|| {
+            format!("Failed to spawn libfuzzer binary: {binary}")
+        })?));
 
         Ok(cmd_str)
     }
@@ -1013,8 +1009,6 @@ fn kill_subprocesses_recursively(pid: &str) -> Result<()> {
     }
     Ok(())
 }
-
-
 
 fn stop_fuzzers(processes: &mut [Option<process::Child>]) -> Result<()> {
     for slot in processes.iter_mut() {

@@ -1,18 +1,18 @@
-/// Corpus sync directories (all under {output}/{target}/):
-///
-/// AFL:
-///   afl/mainaflfuzzer/queue/  — AFL main queue. Source for syncing to other engines.
-///                               Inbound sync from hongg/libfuzzer is handled by AFL's -F flag.
-/// Honggfuzz:
-///   honggfuzz/corpus/         — hongg output corpus. Source for syncing FROM hongg.
-///   honggfuzz/dynamic_input/  — hongg --dynamic_input dir. Polled by hongg, files DELETED after ingestion:
-///                               https://github.com/google/honggfuzz/blob/f0314885bab1a4d9aa64eda51ba100b98aa360b0/input.c#L712-L713
-///                               This is the sync TARGET for feeding new inputs to hongg.
-/// Libfuzzer:
-///   libfuzzer/corpus/         — libfuzzer corpus dir. Both source AND target.
-///                               libfuzzer re-scans it periodically (-reload=1).
-/// External:
-///   User-supplied --external-corpus dirs. Source only.
+//! Corpus sync directories (all under {output}/{target}/):
+//!
+//! AFL:
+//!   afl/mainaflfuzzer/queue/  — AFL main queue. Source for syncing to other engines.
+//!                               Inbound sync from hongg/libfuzzer is handled by AFL's -F flag.
+//! Honggfuzz:
+//!   honggfuzz/corpus/         — hongg output corpus. Source for syncing FROM hongg.
+//!   honggfuzz/dynamic_input/  — hongg --dynamic_input dir. Polled by hongg, files DELETED after ingestion:
+//!                               https://github.com/google/honggfuzz/blob/f0314885bab1a4d9aa64eda51ba100b98aa360b0/input.c#L712-L713
+//!                               This is the sync TARGET for feeding new inputs to hongg.
+//! Libfuzzer:
+//!   libfuzzer/corpus/         — libfuzzer corpus dir. Both source AND target.
+//!                               libfuzzer re-scans it periodically (-reload=1).
+//! External:
+//!   User-supplied --external-corpus dirs. Source only.
 
 use anyhow::Result;
 use std::collections::HashSet;
