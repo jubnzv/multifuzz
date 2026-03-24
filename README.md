@@ -55,9 +55,6 @@ timeout = 10
 sync_interval = 60
 dictionaries = ["./dict.dict"]
 
-[fuzz.web]
-enabled = true
-
 # Per-worker AFL++ configuration. No hidden defaults — everything explicit.
 # [fuzz.afl.all.env] sets base env vars for every AFL worker.
 # [fuzz.afl.workerN]  overrides for specific worker N (0=main, 1+=secondary).
@@ -95,10 +92,6 @@ multifuzz run my_target -i output/my_target/crashes/ -r
 # Add external inputs to a running fuzzing session
 multifuzz add-corpus my_target -i interesting_inputs/ -r
 ```
-
-## Web dashboard
-
-An optional lightweight web UI (`[fuzz.web] enabled = true`) provides real-time monitoring, pause/resume controls, and worker scaling for running campaigns.
 
 ## How it works
 

@@ -3,7 +3,6 @@ mod config;
 mod fuzz;
 mod run;
 mod ui;
-mod web;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -93,12 +92,6 @@ pub struct Fuzz {
     /// Recursively traverse external corpus directories
     #[clap(long = "external-corpus-recursive")]
     external_corpus_recursive: bool,
-    /// Enable web dashboard (auto-refreshing HTML page)
-    #[clap(long = "web", action)]
-    web: bool,
-    /// Port for the web dashboard
-    #[clap(long = "web-port", value_name = "PORT")]
-    web_port: Option<u16>,
     /// Parsed AFL "all" config from TOML (not a CLI flag).
     #[clap(skip)]
     afl_all_config: Option<config::WorkerConfig>,
@@ -146,11 +139,6 @@ impl Fuzz {
                 .unwrap_or(DEFAULT_MAX_INPUT_SIZE),
         );
         self.sync_interval = Some(self.sync_interval.or(toml.sync_interval).unwrap_or(60));
-        self.web_port = Some(
-            self.web_port
-                .or(toml.web.as_ref().and_then(|w| w.port))
-                .unwrap_or(8080),
-        );
 
         // Output defaults
         if self.output.is_none() {
@@ -166,11 +154,6 @@ impl Fuzz {
         }
         if !self.external_corpus_recursive {
             self.external_corpus_recursive = toml.external_corpus_recursive.unwrap_or(false);
-        }
-
-        // Web
-        if !self.web {
-            self.web = toml.web.as_ref().and_then(|w| w.enabled).unwrap_or(false);
         }
 
         // AFL per-worker configs (TOML only)
@@ -199,9 +182,6 @@ impl Fuzz {
     }
     pub fn sync_interval(&self) -> u64 {
         self.sync_interval.unwrap()
-    }
-    pub fn web_port(&self) -> u16 {
-        self.web_port.unwrap()
     }
     pub fn output(&self) -> &Path {
         self.output.as_deref().unwrap()

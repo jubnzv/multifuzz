@@ -20,7 +20,6 @@ pub struct FuzzConfig {
     pub dictionaries: Option<Vec<PathBuf>>,
     pub external_corpus: Option<Vec<PathBuf>>,
     pub external_corpus_recursive: Option<bool>,
-    pub web: Option<WebConfig>,
     /// Honggfuzz config: [fuzz.honggfuzz.worker]. Present = enabled.
     pub honggfuzz: Option<SatelliteEngineConfig>,
     /// Libfuzzer config: [fuzz.libfuzzer.worker]. Present = enabled.
@@ -33,12 +32,6 @@ pub struct FuzzConfig {
 #[derive(Clone, Deserialize, Default)]
 pub struct SatelliteEngineConfig {
     pub worker: Option<WorkerConfig>,
-}
-
-#[derive(Deserialize, Default)]
-pub struct WebConfig {
-    pub enabled: Option<bool>,
-    pub port: Option<u16>,
 }
 
 /// Worker config shared by ALL engines (AFL, honggfuzz, libfuzzer).

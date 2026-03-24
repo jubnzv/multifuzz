@@ -1,18 +1,15 @@
-use crate::ui::{Dashboard, EngineInfo, EngineKind, ProcessSlot};
-use crate::{config, web, Build, Fuzz};
+use crate::ui::ProcessSlot;
+use crate::{config, Build, Fuzz};
 use anyhow::{anyhow, Context, Result};
 use glob::glob;
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     env, fs,
     fs::File,
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
     process::{self, Stdio},
-    sync::{
-        atomic::{AtomicBool, Ordering},
-        mpsc, Arc, Mutex,
-    },
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -49,12 +46,6 @@ extern "C" fn handle_sigint(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
-pub enum WebCommand {
-    ScaleAfl(i32),
-    PauseSlot(usize),
-    ResumeSlot(usize),
-    RemoveSlot(usize),
-}
 use std::os::unix::process::CommandExt;
 use twox_hash::XxHash64;
 
@@ -167,84 +158,20 @@ impl Fuzz {
             self.check_honggfuzz_oversized_files()?;
         }
 
-        // Web dashboard setup (optional)
-        let (cmd_rx, web_html, _web_handle) = if self.web {
-            let loading_html = concat!(
-                "<!DOCTYPE html><html><head><meta charset=\"utf-8\">",
-                "<meta http-equiv=\"refresh\" content=\"2\">",
-                "<title>multifuzz</title>",
-                "<style>body{font-family:monospace;background:#1a1a2e;color:#e0e0e0;padding:20px}</style>",
-                "</head><body><h1>multifuzz</h1><p>Starting fuzzers...</p></body></html>",
-            );
-            let mut init_map = HashMap::new();
-            for tab in &["exec", "corpus", "cpu", "mem"] {
-                init_map.insert(tab.to_string(), loading_html.to_string());
-            }
-            let html: Arc<Mutex<HashMap<String, String>>> = Arc::new(Mutex::new(init_map));
-            let (tx, rx) = mpsc::channel::<WebCommand>();
-            let logs_dir = format!("{}/logs", self.output_target());
-            let (handle, port) =
-                web::start_server(self.web_port(), html.clone(), tx, &STOP, logs_dir)?;
-            let url = format!("http://127.0.0.1:{port}");
-            eprintln!("    Dashboard: {url}");
-            let _ = process::Command::new("xdg-open")
-                .arg(&url)
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn();
-            (Some(rx), Some(html), Some(handle))
-        } else {
-            (None, None, None)
-        };
-
         unsafe {
             let mut sa: libc::sigaction = std::mem::zeroed();
             sa.sa_sigaction = handle_sigint as libc::sighandler_t;
             libc::sigemptyset(&mut sa.sa_mask);
-            // No SA_RESTART: interrupted syscalls return EINTR immediately.
             sa.sa_flags = 0;
             libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
         }
 
         let loop_start = Instant::now();
 
-        let (mut processes, engines) = self.spawn_fuzzers_afl_first()?;
+        let mut processes = self.spawn_fuzzers_afl_first()?;
         self.print_launch_info(&crash_dir);
 
-        let abs_corpus = fs::canonicalize(self.corpus_dir())
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| self.corpus_dir());
-        let abs_external: Vec<String> = self
-            .external_corpus
-            .iter()
-            .map(|p| {
-                fs::canonicalize(p)
-                    .map(|c| c.display().to_string())
-                    .unwrap_or_else(|_| p.display().to_string())
-            })
-            .collect();
-        let abs_crash = fs::canonicalize(&crash_dir)
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| crash_dir.clone());
-        let mut dashboard = Dashboard::new(
-            self.target(),
-            &self.output_target(),
-            engines,
-            self.sync_interval(),
-            &abs_corpus,
-            abs_external,
-            &abs_crash,
-        );
-        dashboard.record_baseline();
-
-        self.run_phase(
-            &mut processes,
-            &mut dashboard,
-            crash_path,
-            cmd_rx.as_ref(),
-            web_html.as_ref(),
-        )?;
+        self.run_loop(&mut processes, crash_path)?;
 
         stop_fuzzers(&mut processes)?;
         let _ = self.collect_crashes(crash_path);
@@ -302,15 +229,11 @@ impl Fuzz {
         }
     }
 
-    /// Run the main tick loop: crash collection, corpus sync, optional web
-    /// dashboard update, liveness check.
-    fn run_phase(
+    /// Main loop: crash collection, corpus sync, liveness check.
+    fn run_loop(
         &mut self,
-        processes: &mut Vec<Option<ProcessSlot>>,
-        dashboard: &mut Dashboard,
+        processes: &mut [Option<ProcessSlot>],
         crash_path: &Path,
-        cmd_rx: Option<&mpsc::Receiver<WebCommand>>,
-        web_html: Option<&Arc<Mutex<HashMap<String, String>>>>,
     ) -> Result<()> {
         let mut last_synced_created_time: Option<SystemTime> = None;
         let mut last_sync_time = Instant::now();
@@ -326,30 +249,6 @@ impl Fuzz {
                 break;
             }
 
-            // Drain web commands, batching rapid-fire scale clicks
-            if let Some(rx) = cmd_rx {
-                let mut afl_delta: i32 = 0;
-                while let Ok(cmd) = rx.try_recv() {
-                    match cmd {
-                        WebCommand::ScaleAfl(d) => {
-                            afl_delta += d;
-                        }
-                        WebCommand::PauseSlot(slot) => {
-                            handle_pause_slot(processes, slot);
-                        }
-                        WebCommand::ResumeSlot(slot) => {
-                            handle_resume_slot(processes, slot);
-                        }
-                        WebCommand::RemoveSlot(slot) => {
-                            self.handle_remove_slot(slot, processes, dashboard)?;
-                        }
-                    }
-                }
-                if afl_delta != 0 {
-                    self.handle_scale_afl(afl_delta, processes, dashboard)?;
-                }
-            }
-
             // ── crash collection (non-fatal during shutdown) ────────────
             if let Err(e) = self.collect_crashes(crash_path) {
                 if STOP.load(Ordering::Relaxed) {
@@ -360,24 +259,6 @@ impl Fuzz {
 
             // ── corpus sync (every N minutes) ───────────────────────────
             if last_sync_time.elapsed().as_secs() > self.sync_interval() * 60 {
-                dashboard.set_syncing(true);
-                if let Some(wh) = web_html {
-                    let (stats, corpus, _) = dashboard.collect_stats(processes);
-                    dashboard.record_tick(corpus, processes);
-                    let mut map = HashMap::new();
-                    let tabs: &[&str] = if dashboard.has_external_corpus() {
-                        &["exec", "corpus", "cpu", "mem", "ext-corpus"]
-                    } else {
-                        &["exec", "corpus", "cpu", "mem"]
-                    };
-                    for tab in tabs {
-                        map.insert(
-                            tab.to_string(),
-                            dashboard.render_html(&stats, corpus, processes, tab),
-                        );
-                    }
-                    *wh.lock().unwrap() = map;
-                }
                 let sync_result = self.sync_corpus_afl_first(last_synced_created_time);
                 match sync_result {
                     Ok(t) => last_synced_created_time = t,
@@ -389,29 +270,13 @@ impl Fuzz {
                     }
                 }
                 last_sync_time = Instant::now();
-                dashboard.set_syncing(false);
             }
 
-            // ── collect stats + update web + liveness check ─────────────
-            let (stats, corpus, all_dead) = dashboard.collect_stats(processes);
-            dashboard.record_tick(corpus, processes);
-
-            if let Some(wh) = web_html {
-                let mut map = HashMap::new();
-                let tabs: &[&str] = if dashboard.has_external_corpus() {
-                    &["exec", "corpus", "cpu", "mem", "ext-corpus"]
-                } else {
-                    &["exec", "corpus", "cpu", "mem"]
-                };
-                for tab in tabs {
-                    map.insert(
-                        tab.to_string(),
-                        dashboard.render_html(&stats, corpus, processes, tab),
-                    );
-                }
-                *wh.lock().unwrap() = map;
-            }
-
+            // ── liveness check ──────────────────────────────────────────
+            let all_dead = processes.iter_mut().all(|slot| {
+                slot.as_mut()
+                    .is_none_or(|ps| ps.child.try_wait().unwrap_or(None).is_some())
+            });
             if all_dead {
                 break;
             }
@@ -640,7 +505,7 @@ impl Fuzz {
 
     // ── spawning ────────────────────────────────────────────────────────
 
-    fn spawn_fuzzers_afl_first(&mut self) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
+    fn spawn_fuzzers_afl_first(&mut self) -> Result<Vec<Option<ProcessSlot>>> {
         let (a, h, l) = self.allocate_jobs();
         self.spawn_fuzzers_with_allocation(a, h, l)
     }
@@ -650,53 +515,31 @@ impl Fuzz {
         afl_jobs: u32,
         honggfuzz_jobs: u32,
         libfuzzer_jobs: u32,
-    ) -> Result<(Vec<Option<ProcessSlot>>, Vec<EngineInfo>)> {
+    ) -> Result<Vec<Option<ProcessSlot>>> {
         if afl_jobs == 0 && honggfuzz_jobs == 0 && libfuzzer_jobs == 0 {
             return Err(anyhow!("Pick at least one fuzzer"));
         }
 
         let mut handles: Vec<Option<ProcessSlot>> = vec![];
-        let mut engines = vec![];
         let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
 
         if afl_jobs > 0 {
             fs::create_dir_all(format!("{}/afl", self.output_target()))?;
-            let start = handles.len();
-            let _afl_cmds = self.spawn_afl(&cargo, afl_jobs, &mut handles)?;
-            engines.push(EngineInfo {
-                name: format!("AFL++ ({afl_jobs}P)"),
-                kind: EngineKind::Afl,
-                process_indices: (start..handles.len()).collect(),
-                worker_count: afl_jobs,
-            });
+            self.spawn_afl(&cargo, afl_jobs, &mut handles)?;
             eprintln!("    Launched AFL++ ({afl_jobs} instances)");
         }
 
         if honggfuzz_jobs > 0 {
-            let start = handles.len();
-            let _hfuzz_cmd = self.spawn_honggfuzz(&cargo, &mut handles)?;
-            engines.push(EngineInfo {
-                name: "honggfuzz".to_string(),
-                kind: EngineKind::Honggfuzz,
-                process_indices: (start..handles.len()).collect(),
-                worker_count: honggfuzz_jobs,
-            });
+            self.spawn_honggfuzz(&cargo, &mut handles)?;
             eprintln!("    Launched honggfuzz");
         }
 
         if libfuzzer_jobs > 0 {
-            let start = handles.len();
-            let _lf_cmd = self.spawn_libfuzzer(&mut handles)?;
-            engines.push(EngineInfo {
-                name: "libfuzzer".to_string(),
-                kind: EngineKind::Libfuzzer,
-                process_indices: (start..handles.len()).collect(),
-                worker_count: libfuzzer_jobs,
-            });
+            self.spawn_libfuzzer(&mut handles)?;
             eprintln!("    Launched libfuzzer");
         }
 
-        // Print log paths so the user can tail them in another terminal.
+        // Print log paths.
         let logs_dir = format!("{}/logs", self.output_target());
         eprintln!();
         eprintln!("    Log files:");
@@ -717,7 +560,7 @@ impl Fuzz {
             eprintln!("      tail -f {logs_dir}/libfuzzer.log");
         }
 
-        Ok((handles, engines))
+        Ok(handles)
     }
 
     /// Allocate jobs between AFL++, honggfuzz and libfuzzer.
@@ -913,8 +756,6 @@ impl Fuzz {
                 handles.push(Some(ProcessSlot {
                     child,
                     paused: false,
-                    job_num: Some(0),
-                    command: Some(cmd_str),
                 }));
             } else {
                 let fuzzer_name = String::from("-Mmainaflfuzzer");
@@ -995,8 +836,6 @@ impl Fuzz {
                 handles.push(Some(ProcessSlot {
                     child: cmd.spawn()?,
                     paused: false,
-                    job_num: Some(0),
-                    command: Some(main_cmd_str),
                 }));
             }
         }
@@ -1009,8 +848,6 @@ impl Fuzz {
             handles.push(Some(ProcessSlot {
                 child,
                 paused: false,
-                job_num: Some(job_num),
-                command: Some(sec_cmd_str),
             }));
         }
 
@@ -1100,8 +937,6 @@ impl Fuzz {
         handles.push(Some(ProcessSlot {
             child: cmd.spawn()?,
             paused: false,
-            job_num: None,
-            command: Some(cmd_str.clone()),
         }));
 
         Ok(cmd_str)
@@ -1176,104 +1011,9 @@ impl Fuzz {
             child: cmd.spawn()
                 .with_context(|| format!("Failed to spawn libfuzzer binary: {binary}"))?,
             paused: false,
-            job_num: None,
-            command: Some(cmd_str.clone()),
         }));
 
         Ok(cmd_str)
-    }
-
-    /// Dynamically add or remove AFL++ secondary workers.
-    fn handle_scale_afl(
-        &mut self,
-        delta: i32,
-        processes: &mut Vec<Option<ProcessSlot>>,
-        dashboard: &mut Dashboard,
-    ) -> Result<()> {
-        // Find the AFL engine in the dashboard
-        let afl_idx = dashboard
-            .engines
-            .iter()
-            .position(|e| matches!(e.kind, EngineKind::Afl));
-        let Some(afl_idx) = afl_idx else {
-            return Ok(()); // AFL not active
-        };
-
-        let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
-
-        if delta > 0 {
-            // Scale up
-            for _ in 0..delta {
-                let job_num = self.next_afl_job_num;
-                let (child, cmd_str) = self.spawn_afl_secondary(&cargo, job_num)?;
-                let slot_idx = processes.len();
-                processes.push(Some(ProcessSlot {
-                    child,
-                    paused: false,
-                    job_num: Some(job_num),
-                    command: Some(cmd_str),
-                }));
-                dashboard.engines[afl_idx].process_indices.push(slot_idx);
-                dashboard.engines[afl_idx].worker_count += 1;
-                self.next_afl_job_num += 1;
-            }
-        } else {
-            // Scale down
-            let remove_count = (-delta) as usize;
-            for _ in 0..remove_count {
-                let engine = &mut dashboard.engines[afl_idx];
-                // Never kill the main instance (always at index 0 in process_indices)
-                if engine.process_indices.len() <= 1 {
-                    break;
-                }
-                let slot_idx = engine.process_indices.pop().unwrap();
-                if let Some(ps) = processes[slot_idx].as_ref() {
-                    if ps.paused {
-                        send_signal_to_process_group(ps.child.id(), libc::SIGCONT);
-                    }
-                    let _ = kill_process_tree(ps.child.id());
-                }
-                processes[slot_idx] = None;
-                engine.worker_count -= 1;
-            }
-        }
-
-        // Update the engine display name
-        let wc = dashboard.engines[afl_idx].worker_count;
-        dashboard.engines[afl_idx].name = format!("AFL++ ({wc}P)");
-
-        Ok(())
-    }
-
-    /// Remove a specific process slot (used by the web UI remove button).
-    fn handle_remove_slot(
-        &mut self,
-        slot: usize,
-        processes: &mut [Option<ProcessSlot>],
-        dashboard: &mut Dashboard,
-    ) -> Result<()> {
-        for engine in &mut dashboard.engines {
-            if let Some(pos) = engine.process_indices.iter().position(|&idx| idx == slot) {
-                // For AFL, don't allow removing the main instance (position 0)
-                if matches!(engine.kind, EngineKind::Afl) && pos == 0 {
-                    return Ok(());
-                }
-                if let Some(ps) = processes[slot].take() {
-                    if ps.paused {
-                        send_signal_to_process_group(ps.child.id(), libc::SIGCONT);
-                    }
-                    let _ = kill_process_tree(ps.child.id());
-                }
-                engine.process_indices.remove(pos);
-                engine.worker_count -= 1;
-                if matches!(engine.kind, EngineKind::Afl) {
-                    let wc = engine.worker_count;
-                    engine.name = format!("AFL++ ({wc}P)");
-                }
-                break;
-            }
-        }
-        Ok(())
     }
 
     /// Check for oversized files that would crash honggfuzz and prompt for removal.
@@ -1376,23 +1116,6 @@ fn send_signal_to_process_group(pid: u32, signal: libc::c_int) {
     }
 }
 
-fn handle_pause_slot(processes: &mut [Option<ProcessSlot>], slot: usize) {
-    if let Some(ps) = processes.get_mut(slot).and_then(|o| o.as_mut()) {
-        if !ps.paused && ps.child.try_wait().unwrap_or(None).is_none() {
-            send_signal_to_process_group(ps.child.id(), libc::SIGSTOP);
-            ps.paused = true;
-        }
-    }
-}
-
-fn handle_resume_slot(processes: &mut [Option<ProcessSlot>], slot: usize) {
-    if let Some(ps) = processes.get_mut(slot).and_then(|o| o.as_mut()) {
-        if ps.paused && ps.child.try_wait().unwrap_or(None).is_none() {
-            send_signal_to_process_group(ps.child.id(), libc::SIGCONT);
-            ps.paused = false;
-        }
-    }
-}
 
 fn stop_fuzzers(processes: &mut [Option<ProcessSlot>]) -> Result<()> {
     // Send SIGTERM to all workers first.

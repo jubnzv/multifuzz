@@ -6,7 +6,7 @@
 #     -- fuzz multifuzz_source_fuzzer --sync-interval 60 -j 4 \
 #     -i ../../source_corpus -o ../../output/multi \
 #     -x ../../dicts/move.dict -x ../../dicts/move_rare.dict -x ../../dicts/crash.dict \
-#     -t 10 --external-corpus /tmp/move-corpus --web
+#     -t 10 --external-corpus /tmp/move-corpus
 #
 # With this config in place, the invocation simplifies to:
 #   AFL_SKIP_CPUFREQ=1 cargo run --release -- fuzz
@@ -24,9 +24,6 @@ dictionaries = [
     "../../dicts/crash.dict",
 ]
 external_corpus = ["/tmp/move-corpus"]
-
-[fuzz.web]
-enabled = true
 
 # Per-worker AFL++ configuration.
 # NO hardcoded env defaults — everything is explicit in the config.
