@@ -119,7 +119,7 @@ impl Fuzz {
         let crash_dir = format!("{}/crashes/{}/", self.output_target(), timestamp);
         fs::create_dir_all(&crash_dir)?;
         fs::create_dir_all(format!("{}/logs/", self.output_target()))?;
-        fs::create_dir_all(format!("{}/queue/", self.output_target()))?;
+        fs::create_dir_all(format!("{}/honggfuzz/dynamic_input/", self.output_target()))?;
         if self.libfuzzer_enabled() {
             fs::create_dir_all(format!("{}/libfuzzer/corpus/", self.output_target()))?;
             fs::create_dir_all(format!("{}/libfuzzer/crashes/", self.output_target()))?;
@@ -346,7 +346,7 @@ impl Fuzz {
         // Build source lists per engine.
         let afl_queue: PathBuf = format!("{}/afl/mainaflfuzzer/queue", self.output_target()).into();
         let hongg_corpus: PathBuf = format!("{}/honggfuzz/corpus", self.output_target()).into();
-        let hongg_input: PathBuf = format!("{}/queue", self.output_target()).into();
+        let hongg_input: PathBuf = format!("{}/honggfuzz/dynamic_input", self.output_target()).into();
         let lf_corpus: PathBuf = format!("{}/libfuzzer/corpus", self.output_target()).into();
 
         let external: Vec<PathBuf> = crate::sync::collect_external_files(
@@ -803,7 +803,7 @@ impl Fuzz {
         let hfuzz_run_args = format!(
             "--input={corpus} \
              -o{}/honggfuzz/corpus \
-             --dynamic_input={}/queue \
+             --dynamic_input={}/honggfuzz/dynamic_input \
              -F{} \
              {timeout_flag} {dict_flag} {extra_args}",
             self.output_target(),
@@ -941,7 +941,7 @@ impl Fuzz {
         let max_len = self.max_input_size() as u64;
         let mut oversized: Vec<PathBuf> = Vec::new();
         for dir in [
-            format!("{}/queue", self.output_target()),
+            format!("{}/honggfuzz/dynamic_input", self.output_target()),
             format!("{}/honggfuzz/corpus", self.output_target()),
         ] {
             if let Ok(entries) = fs::read_dir(&dir) {
