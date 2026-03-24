@@ -34,7 +34,11 @@ pub enum Command {
 }
 
 #[derive(clap::Args)]
-pub struct Build {}
+pub struct Build {
+    /// Build a separate cmplog-instrumented AFL binary (set internally by fuzz command).
+    #[clap(skip)]
+    pub afl_cmplog: bool,
+}
 
 #[derive(clap::Args)]
 pub struct Fuzz {

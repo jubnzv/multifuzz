@@ -15,7 +15,6 @@ impl Build {
                 "--target-dir=target/afl",
             ])
             .env("AFL_QUIET", "1")
-            .env("AFL_LLVM_CMPLOG", "1")
             .env("RUSTFLAGS", env::var("RUSTFLAGS").unwrap_or_default())
             .env("RUSTDOCFLAGS", env::var("RUSTDOCFLAGS").unwrap_or_default())
             .spawn()?
@@ -28,6 +27,31 @@ impl Build {
             ));
         }
         eprintln!("    Finished afl");
+
+        if self.afl_cmplog {
+            eprintln!("    Building afl (cmplog)");
+            let status = process::Command::new(&cargo)
+                .args([
+                    "afl",
+                    "build",
+                    "--features=multifuzz/afl",
+                    "--target-dir=target/afl-cmplog",
+                ])
+                .env("AFL_QUIET", "1")
+                .env("AFL_LLVM_CMPLOG", "1")
+                .env("RUSTFLAGS", env::var("RUSTFLAGS").unwrap_or_default())
+                .env("RUSTDOCFLAGS", env::var("RUSTDOCFLAGS").unwrap_or_default())
+                .spawn()?
+                .wait()
+                .context("Error spawning afl cmplog build command")?;
+            if !status.success() {
+                return Err(anyhow!(
+                    "Error building afl cmplog fuzzer: exited with {:?}",
+                    status.code()
+                ));
+            }
+            eprintln!("    Finished afl (cmplog)");
+        }
 
         eprintln!("    Building honggfuzz");
         let status = process::Command::new(&cargo)

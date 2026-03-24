@@ -89,6 +89,17 @@ impl Fuzz {
         self.libfuzzer_config.is_some()
     }
 
+    /// Check if any AFL worker config has cmplog level args (-l followed by a digit).
+    fn needs_cmplog(&self) -> bool {
+        self.afl_worker_configs.values().any(|cfg| {
+            cfg.args.as_deref().map_or(false, |args| {
+                args.split_whitespace().any(|a| {
+                    a.starts_with("-l") && a.len() > 2 && a.as_bytes()[2].is_ascii_digit()
+                })
+            })
+        })
+    }
+
     // ── public entry point ──────────────────────────────────────────────
 
     pub fn fuzz(&mut self) -> Result<()> {
@@ -106,7 +117,9 @@ impl Fuzz {
         fs::create_dir_all(self.output())?;
         self.output = Some(self.output().canonicalize()?);
 
-        let build = Build {};
+        let build = Build {
+            afl_cmplog: self.needs_cmplog(),
+        };
         build.build().context("Failed to build the fuzzers")?;
 
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
@@ -571,8 +584,14 @@ impl Fuzz {
         .filter(|a| !a.is_empty())
         .collect();
 
-        // Append user args from config.
+        // Auto-inject cmplog binary path if worker uses -l (cmplog level).
         if let Some(extra) = worker_cfg.and_then(|c| c.args.as_deref()) {
+            let has_cmplog = extra.split_whitespace().any(|a| {
+                a.starts_with("-l") && a.len() > 2 && a.as_bytes()[2].is_ascii_digit()
+            });
+            if has_cmplog {
+                afl_args.push(format!("-c./target/afl-cmplog/debug/{}", self.target()));
+            }
             afl_args.extend(extra.split_whitespace().map(|s| s.to_string()));
         }
 
@@ -710,8 +729,14 @@ impl Fuzz {
                 .filter(|a| !a.is_empty())
                 .collect();
 
-                // Append user args from config.
+                // Auto-inject cmplog binary path if worker uses -l (cmplog level).
                 if let Some(extra) = worker_cfg.and_then(|c| c.args.as_deref()) {
+                    let has_cmplog = extra.split_whitespace().any(|a| {
+                        a.starts_with("-l") && a.len() > 2 && a.as_bytes()[2].is_ascii_digit()
+                    });
+                    if has_cmplog {
+                        afl_args.push(format!("-c./target/afl-cmplog/debug/{}", self.target()));
+                    }
                     afl_args.extend(extra.split_whitespace().map(|s| s.to_string()));
                 }
 
