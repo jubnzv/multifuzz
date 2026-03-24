@@ -7,6 +7,7 @@ impl Build {
         let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
 
         eprintln!("    Building afl");
+        eprintln!("    $ AFL_QUIET=1 {cargo} afl build --features=multifuzz/afl --target-dir=target/afl");
         let status = process::Command::new(&cargo)
             .args([
                 "afl",
@@ -30,6 +31,7 @@ impl Build {
 
         if self.afl_cmplog {
             eprintln!("    Building afl (cmplog)");
+            eprintln!("    $ AFL_QUIET=1 AFL_LLVM_CMPLOG=1 {cargo} afl build --features=multifuzz/afl --target-dir=target/afl-cmplog");
             let status = process::Command::new(&cargo)
                 .args([
                     "afl",
@@ -54,6 +56,7 @@ impl Build {
         }
 
         eprintln!("    Building honggfuzz");
+        eprintln!("    $ CARGO_TARGET_DIR=./target/honggfuzz HFUZZ_BUILD_ARGS='--features=multifuzz/honggfuzz' {cargo} hfuzz build-debug");
         let status = process::Command::new(&cargo)
             .args(["hfuzz", "build-debug"])
             .env("CARGO_TARGET_DIR", "./target/honggfuzz")
@@ -71,7 +74,6 @@ impl Build {
         }
         eprintln!("    Finished honggfuzz");
 
-        eprintln!("    Building libfuzzer (with SanitizerCoverage)");
         let sancov_flags = [
             "-Cpasses=sancov-module",
             "-Cllvm-args=-sanitizer-coverage-level=4",
@@ -98,6 +100,8 @@ impl Build {
             host.to_uppercase().replace('-', "_")
         );
 
+        eprintln!("    Building libfuzzer");
+        eprintln!("    $ {target_rustflags_key}='{sancov_flags}' {cargo} build --release --target={host} --features=multifuzz/libfuzzer --target-dir=target/libfuzzer");
         let status = process::Command::new(&cargo)
             .args([
                 "build",
