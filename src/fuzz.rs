@@ -1,6 +1,5 @@
 use crate::{config, Build, Fuzz};
 use anyhow::{anyhow, Context, Result};
-use glob::glob;
 use std::{
     collections::{BTreeMap, HashSet},
     env, fs,
@@ -10,7 +9,7 @@ use std::{
     process::{self, Stdio},
     sync::atomic::{AtomicBool, Ordering},
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime},
 };
 
 /// Print per-worker configuration to stderr.
@@ -121,9 +120,6 @@ impl Fuzz {
         };
         build.build().context("Failed to build the fuzzers")?;
 
-        let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
-        let crash_dir = format!("{}/crashes/{}/", self.output_target(), timestamp);
-        fs::create_dir_all(&crash_dir)?;
         fs::create_dir_all(format!("{}/logs/", self.output_target()))?;
         fs::create_dir_all(format!("{}/honggfuzz/dynamic_input/", self.output_target()))?;
         if self.libfuzzer_enabled() {
@@ -145,8 +141,6 @@ impl Fuzz {
             self.merged_dict = Some(merge_dicts(&self.dictionaries, &self.output_target())?);
         }
 
-        let crash_path = Path::new(&crash_dir);
-
         if self.honggfuzz_enabled() {
             self.check_honggfuzz_oversized_files()?;
         }
@@ -162,12 +156,11 @@ impl Fuzz {
         let loop_start = Instant::now();
 
         let mut processes = self.spawn_fuzzers_afl_first()?;
-        self.print_launch_info(&crash_dir);
+        self.print_launch_info();
 
-        self.run_loop(&mut processes, crash_path)?;
+        self.run_loop(&mut processes)?;
 
         stop_fuzzers(&mut processes)?;
-        let _ = self.collect_crashes(crash_path);
 
         let elapsed = loop_start.elapsed().as_secs();
         let days = elapsed / 86400;
@@ -184,50 +177,38 @@ impl Fuzz {
             format!("{secs} secs")
         };
 
-        let crash_count = fs::read_dir(crash_path)
-            .map(|entries| entries.flatten().count())
-            .unwrap_or(0);
-        let corpus_count = fs::read_dir(format!("{}/corpus", self.output_target()))
-            .map(|entries| entries.flatten().count())
-            .unwrap_or(0);
-
         eprintln!();
-        eprintln!("── Session complete ──────────────────────────────");
-        eprintln!(" Runtime  : {runtime}");
-        eprintln!(" Crashes  : {crash_count}");
-        eprintln!(" Corpus   : {corpus_count} files");
-        eprintln!();
-        eprintln!(" Results:");
-        eprintln!("   Crashes : {crash_dir}");
-        eprintln!("   Corpus  : {}/corpus/", self.output_target());
-        eprintln!("   Logs    : {}/logs/", self.output_target());
+        eprintln!("── Session complete ({runtime}) ──");
 
         Ok(())
     }
 
-    fn print_launch_info(&self, crash_dir: &str) {
-        eprintln!("    Crashes: {crash_dir}");
+    fn print_launch_info(&self) {
+        eprintln!();
+        eprintln!("    Crashes:");
+        if self.afl_enabled() {
+            eprintln!("      AFL:       {}/afl/*/crashes/", self.output_target());
+        }
+        if self.honggfuzz_enabled() {
+            eprintln!(
+                "      honggfuzz: {}/honggfuzz/{}/",
+                self.output_target(),
+                self.target()
+            );
+        }
+        if self.libfuzzer_enabled() {
+            eprintln!(
+                "      libfuzzer: {}/libfuzzer/crashes/",
+                self.output_target()
+            );
+        }
         for dir in &self.external_corpus {
-            let count = fs::read_dir(dir)
-                .map(|entries| entries.flatten().filter(|e| e.path().is_file()).count())
-                .unwrap_or(0);
-            if count > 0 {
-                eprintln!(
-                    "    External corpus: {} (contains {count} files — move them to input corpus?)",
-                    dir.display()
-                );
-            } else {
-                eprintln!("    External corpus: {}", dir.display());
-            }
+            eprintln!("    External corpus: {}", dir.display());
         }
     }
 
     /// Main loop: crash collection, corpus sync, liveness check.
-    fn run_loop(
-        &mut self,
-        processes: &mut [Option<process::Child>],
-        crash_path: &Path,
-    ) -> Result<()> {
+    fn run_loop(&mut self, processes: &mut [Option<process::Child>]) -> Result<()> {
         let mut last_synced_created_time: Option<SystemTime> = None;
         let mut last_sync_time = Instant::now();
 
@@ -240,14 +221,6 @@ impl Fuzz {
 
             if STOP.load(Ordering::Relaxed) {
                 break;
-            }
-
-            // ── crash collection (non-fatal during shutdown) ────────────
-            if let Err(e) = self.collect_crashes(crash_path) {
-                if STOP.load(Ordering::Relaxed) {
-                    break;
-                }
-                return Err(e);
             }
 
             // ── corpus sync (every N minutes) ───────────────────────────
@@ -275,69 +248,6 @@ impl Fuzz {
             }
         }
 
-        Ok(())
-    }
-
-    // ── crash collection ────────────────────────────────────────────────
-
-    fn collect_crashes(&self, crash_path: &Path) -> Result<()> {
-        let afl_pattern = format!("{}/afl/*/crashes", self.output_target());
-        let afl_dirs: Vec<_> = glob(&afl_pattern)
-            .map_err(|_| anyhow!("Failed to read crashes glob pattern"))?
-            .flatten()
-            .map(|d| ("afl", d))
-            .collect();
-
-        let mut dirs: Vec<(&str, PathBuf)> = afl_dirs;
-        dirs.push((
-            "honggfuzz",
-            format!("{}/honggfuzz/{}", self.output_target(), self.target()).into(),
-        ));
-        if self.libfuzzer_enabled() {
-            dirs.push((
-                "libfuzzer",
-                format!("{}/libfuzzer/crashes", self.output_target()).into(),
-            ));
-        }
-
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        for (engine, dir) in dirs {
-            if let Ok(entries) = fs::read_dir(dir) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name();
-                    let name_str = name.to_str().unwrap_or_default();
-                    if name_str.is_empty()
-                        || ["README.txt", "HONGGFUZZ.REPORT.TXT", "input"].contains(&name_str)
-                    {
-                        continue;
-                    }
-                    let dest_name = format!("{engine}_{ts}_{name_str}");
-                    let dest = crash_path.join(&dest_name);
-                    if dest.exists() {
-                        continue;
-                    }
-                    // Also skip if we already collected this crash under a
-                    // different timestamp (same engine + original name).
-                    let already_collected = fs::read_dir(crash_path)
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .any(|e| {
-                            let n = e.file_name();
-                            let s = n.to_str().unwrap_or_default();
-                            s.starts_with(&format!("{engine}_")) && s.ends_with(name_str)
-                        });
-                    if already_collected {
-                        continue;
-                    }
-                    fs::copy(entry.path(), dest)?;
-                }
-            }
-        }
         Ok(())
     }
 

@@ -93,8 +93,13 @@ multifuzz build
 multifuzz fuzz
 
 # Replay a crash or directory of inputs
-multifuzz run my_target -i output/my_target/crashes/ -r
+multifuzz run my_target -i output/my_target/afl/master/crashes/ -r
 ```
+
+Crashes are written by each engine to its own directory. Locations are printed at startup:
+- AFL: `{output}/{target}/afl/*/crashes/`
+- honggfuzz: `{output}/{target}/honggfuzz/{target}/`
+- libfuzzer: `{output}/{target}/libfuzzer/crashes/`
 
 ## License
 
