@@ -92,10 +92,9 @@ impl Fuzz {
     /// Check if any AFL worker config has cmplog level args (-l followed by a digit).
     fn needs_cmplog(&self) -> bool {
         self.afl_worker_configs.values().any(|cfg| {
-            cfg.args.as_deref().map_or(false, |args| {
-                args.split_whitespace().any(|a| {
-                    a.starts_with("-l") && a.len() > 2 && a.as_bytes()[2].is_ascii_digit()
-                })
+            cfg.args.as_deref().is_some_and(|args| {
+                args.split_whitespace()
+                    .any(|a| a.starts_with("-l") && a.len() > 2 && a.as_bytes()[2].is_ascii_digit())
             })
         })
     }
@@ -586,9 +585,9 @@ impl Fuzz {
 
         // Auto-inject cmplog binary path if worker uses -l (cmplog level).
         if let Some(extra) = worker_cfg.and_then(|c| c.args.as_deref()) {
-            let has_cmplog = extra.split_whitespace().any(|a| {
-                a.starts_with("-l") && a.len() > 2 && a.as_bytes()[2].is_ascii_digit()
-            });
+            let has_cmplog = extra
+                .split_whitespace()
+                .any(|a| a.starts_with("-l") && a.len() > 2 && a.as_bytes()[2].is_ascii_digit());
             if has_cmplog {
                 afl_args.push(format!("-c./target/afl-cmplog/debug/{}", self.target()));
             }

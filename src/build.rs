@@ -7,7 +7,9 @@ impl Build {
         let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
 
         eprintln!("    Building afl");
-        eprintln!("    $ AFL_QUIET=1 {cargo} afl build --features=multifuzz/afl --target-dir=target/afl");
+        eprintln!(
+            "    $ AFL_QUIET=1 {cargo} afl build --features=multifuzz/afl --target-dir=target/afl"
+        );
         let status = process::Command::new(&cargo)
             .args([
                 "afl",
