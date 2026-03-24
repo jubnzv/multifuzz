@@ -34,17 +34,7 @@ pub enum Command {
 }
 
 #[derive(clap::Args)]
-pub struct Build {
-    /// Disable AFL++
-    #[clap(long = "no-afl", action)]
-    no_afl: bool,
-    /// Disable honggfuzz
-    #[clap(long = "no-honggfuzz", action)]
-    no_honggfuzz: bool,
-    /// Disable libfuzzer
-    #[clap(long = "no-libfuzzer", action)]
-    no_libfuzzer: bool,
-}
+pub struct Build {}
 
 #[derive(clap::Args)]
 pub struct Fuzz {
@@ -74,9 +64,6 @@ pub struct Fuzz {
     /// Timeout for a single run in seconds
     #[clap(short, long, value_name = "SECS")]
     timeout: Option<u32>,
-    /// Disable AFL++
-    #[clap(long = "no-afl", action)]
-    no_afl: bool,
     /// Maximum input size in bytes
     #[clap(long = "max-input-size", value_name = "BYTES")]
     max_input_size: Option<u32>,

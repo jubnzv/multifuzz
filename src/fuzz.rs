@@ -78,7 +78,7 @@ impl Fuzz {
     }
 
     fn afl_enabled(&self) -> bool {
-        !self.no_afl
+        self.afl_all_config.is_some() || !self.afl_worker_configs.is_empty()
     }
 
     fn honggfuzz_enabled(&self) -> bool {
@@ -106,12 +106,7 @@ impl Fuzz {
         fs::create_dir_all(self.output())?;
         self.output = Some(self.output().canonicalize()?);
 
-        // Build all enabled engines.
-        let build = Build {
-            no_afl: !self.afl_enabled(),
-            no_honggfuzz: !self.honggfuzz_enabled(),
-            no_libfuzzer: !self.libfuzzer_enabled(),
-        };
+        let build = Build {};
         build.build().context("Failed to build the fuzzers")?;
 
         let timestamp = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis();
