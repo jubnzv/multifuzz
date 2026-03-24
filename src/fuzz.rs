@@ -17,51 +17,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-/// Per-worker AFL++ configuration computed by the distribution algorithm.
-struct AflWorkerConfig {
-    power_schedule: &'static str,
-    cmplog_level: Option<&'static str>,
-    old_queue: bool,
-}
-
-/// Compute AFL++ flags for a secondary worker based on total worker count.
-///
-/// Distributes power schedules, cmplog, and old-queue evenly:
-/// - Power schedules rotate through all available modes.
-/// - Cmplog on ~20% of workers (min 1 if workers >= 3), varying `-l` levels.
-/// - Old queue (`-Z`) on ~10% of workers (min 1 if workers >= 5).
-fn afl_worker_config(job_num: u32, total_secondaries: u32) -> AflWorkerConfig {
-    const SCHEDULES: &[&str] = &[
-        "explore", "fast", "coe", "exploit", "rare", "mmopt", "seek", "lin", "quad",
-    ];
-    const CMPLOG_LEVELS: &[&str] = &["-l2a", "-l1", "-l3at"];
-
-    let n = total_secondaries as usize;
-    let idx = (job_num - 1) as usize; // 0-based index among secondaries
-
-    let power_schedule = SCHEDULES[idx % SCHEDULES.len()];
-
-    // Cmplog: ~20% of workers, at least 1 when >= 3 secondaries.
-    let cmplog_count = if n >= 3 { (n / 5).max(1) } else { 0 };
-    let cmplog_level = if idx < cmplog_count {
-        Some(CMPLOG_LEVELS[idx % CMPLOG_LEVELS.len()])
-    } else {
-        None
-    };
-
-    // Old queue: ~10% of workers, at least 1 when >= 5 secondaries.
-    let old_queue_count = if n >= 5 { (n / 10).max(1) } else { 0 };
-    let old_queue_start = cmplog_count;
-    let old_queue = idx >= old_queue_start && idx < old_queue_start + old_queue_count;
-
-    AflWorkerConfig {
-        power_schedule,
-        cmplog_level,
-        old_queue,
-    }
-}
-
-/// Print per-worker AFL configuration to stderr.
+/// Print per-worker configuration to stderr.
 fn log_afl_worker(job_num: u32, label: &str, env_vars: &BTreeMap<String, String>, cmd: &str) {
     eprintln!("    -- AFL worker {job_num} ({label}) --");
     if env_vars.is_empty() {
@@ -826,20 +782,11 @@ impl Fuzz {
             return self.spawn_afl_custom(job_num, command);
         }
 
-        let total_secondaries = self.next_afl_job_num.max(job_num + 1) - 1;
-        let wc = afl_worker_config(job_num, total_secondaries);
-
         let afl_input_dir = self.afl_input_dir()?;
         let dict_flags = self.afl_dict_flags();
 
         let fuzzer_name = format!("-Ssecondaryfuzzer{job_num}");
-        let old_queue_flag = if wc.old_queue { "-Z" } else { "" };
-
         let target_path = format!("./target/afl/debug/{}", self.target());
-        let cmplog_flags: Vec<String> = match wc.cmplog_level {
-            Some(level) => vec![format!("-c{target_path}"), level.to_string()],
-            None => vec![],
-        };
 
         let timeout_flag = match self.timeout {
             Some(t) => format!("-t{}", t * 1000),
@@ -854,21 +801,25 @@ impl Fuzz {
                 .into()
         };
 
-        let afl_args: Vec<String> = [
+        // Minimal auto-generated args. Everything else (power schedule, cmplog,
+        // old queue, etc.) comes from user's `args` in the config.
+        let mut afl_args: Vec<String> = [
             "afl".to_string(),
             "fuzz".to_string(),
             fuzzer_name,
             format!("-i{afl_input_dir}"),
-            format!("-p{}", wc.power_schedule),
             format!("-o{}/afl", self.output_target()),
-            old_queue_flag.to_string(),
             timeout_flag,
             max_len_flag,
         ]
         .into_iter()
         .filter(|a| !a.is_empty())
-        .chain(cmplog_flags.iter().cloned())
         .collect();
+
+        // Append user args from config.
+        if let Some(extra) = worker_cfg.and_then(|c| c.args.as_deref()) {
+            afl_args.extend(extra.split_whitespace().map(|s| s.to_string()));
+        }
 
         // Resolve env: all config + worker config merged, no hardcoded defaults.
         let env_vars = config::resolve_afl_env(&self.afl_all_config, worker_cfg);
@@ -979,7 +930,6 @@ impl Fuzz {
                     String::new()
                 };
 
-                let power_schedule = "explore";
                 let timeout_flag = match self.timeout {
                     Some(t) => format!("-t{}", t * 1000),
                     None => String::new(),
@@ -994,12 +944,12 @@ impl Fuzz {
 
                 let target_path = format!("./target/afl/debug/{}", self.target());
 
-                let afl_args: Vec<String> = [
+                // Minimal auto-generated args. User adds power schedule etc. via `args`.
+                let mut afl_args: Vec<String> = [
                     "afl".to_string(),
                     "fuzz".to_string(),
                     fuzzer_name.clone(),
                     format!("-i{afl_input_dir}"),
-                    format!("-p{power_schedule}"),
                     format!("-o{}/afl", self.output_target()),
                     honggfuzz_sync_flag.clone(),
                     libfuzzer_sync_flag.clone(),
@@ -1009,6 +959,11 @@ impl Fuzz {
                 .into_iter()
                 .filter(|a| !a.is_empty())
                 .collect();
+
+                // Append user args from config.
+                if let Some(extra) = worker_cfg.and_then(|c| c.args.as_deref()) {
+                    afl_args.extend(extra.split_whitespace().map(|s| s.to_string()));
+                }
 
                 // Resolve env: all config + worker config merged, no hardcoded defaults.
                 let env_vars = config::resolve_afl_env(&self.afl_all_config, worker_cfg);

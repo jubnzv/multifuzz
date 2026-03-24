@@ -27,20 +27,12 @@ pub struct FuzzConfig {
     pub libfuzzer: Option<SatelliteEngineConfig>,
     /// Per-worker AFL++ configuration. Keys: "all" or "workerN".
     /// e.g. [fuzz.afl.all.env], [fuzz.afl.worker2.env]
-    pub afl: Option<HashMap<String, AflWorkerConfig>>,
+    pub afl: Option<HashMap<String, WorkerConfig>>,
 }
 
 #[derive(Clone, Deserialize, Default)]
 pub struct SatelliteEngineConfig {
-    pub worker: Option<SatelliteWorkerConfig>,
-}
-
-#[derive(Clone, Deserialize, Default)]
-pub struct SatelliteWorkerConfig {
-    /// Extra CLI args appended to the auto-generated command.
-    pub args: Option<String>,
-    /// Extra env vars applied to the process.
-    pub env: Option<HashMap<String, String>>,
+    pub worker: Option<WorkerConfig>,
 }
 
 #[derive(Deserialize, Default)]
@@ -49,24 +41,27 @@ pub struct WebConfig {
     pub port: Option<u16>,
 }
 
+/// Worker config shared by ALL engines (AFL, honggfuzz, libfuzzer).
 #[derive(Clone, Deserialize, Default)]
-pub struct AflWorkerConfig {
+pub struct WorkerConfig {
     /// Full command override. When set, replaces all auto-generated args.
     /// Executed via `sh -c`.
     pub command: Option<String>,
+    /// Extra CLI args appended to the auto-generated command.
+    pub args: Option<String>,
     /// Env vars for this worker (or all workers if key is "all").
     pub env: Option<HashMap<String, String>>,
 }
 
 /// Parsed AFL worker configs: the "all" config + per-worker configs.
-pub type AflWorkerConfigs = HashMap<u32, AflWorkerConfig>;
+pub type AflWorkerConfigs = HashMap<u32, WorkerConfig>;
 
 /// Parse the `[fuzz.afl.*]` map into (all_config, per_worker_configs).
 ///
 /// Accepts "all" and "workerN" keys. Rejects "even"/"odd".
 pub fn parse_afl_worker_configs(
-    afl: &HashMap<String, AflWorkerConfig>,
-) -> Result<(Option<AflWorkerConfig>, AflWorkerConfigs)> {
+    afl: &HashMap<String, WorkerConfig>,
+) -> Result<(Option<WorkerConfig>, AflWorkerConfigs)> {
     let mut all_config = None;
     let mut workers = HashMap::new();
     for (key, config) in afl {
@@ -99,8 +94,8 @@ pub fn parse_afl_worker_configs(
 
 /// Merge `all.env` + `workerN.env` into a sorted map. Worker-specific values win on conflict.
 pub fn resolve_afl_env(
-    all: &Option<AflWorkerConfig>,
-    worker: Option<&AflWorkerConfig>,
+    all: &Option<WorkerConfig>,
+    worker: Option<&WorkerConfig>,
 ) -> BTreeMap<String, String> {
     let mut env = BTreeMap::new();
     if let Some(all_cfg) = all {

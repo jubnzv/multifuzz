@@ -101,16 +101,16 @@ pub struct Fuzz {
     web_port: Option<u16>,
     /// Parsed AFL "all" config from TOML (not a CLI flag).
     #[clap(skip)]
-    afl_all_config: Option<config::AflWorkerConfig>,
+    afl_all_config: Option<config::WorkerConfig>,
     /// Parsed per-worker AFL configs from TOML (not a CLI flag).
     #[clap(skip)]
     afl_worker_configs: config::AflWorkerConfigs,
     /// Honggfuzz worker config from TOML. Present = enabled.
     #[clap(skip)]
-    honggfuzz_config: Option<config::SatelliteWorkerConfig>,
+    honggfuzz_config: Option<config::WorkerConfig>,
     /// Libfuzzer worker config from TOML. Present = enabled.
     #[clap(skip)]
-    libfuzzer_config: Option<config::SatelliteWorkerConfig>,
+    libfuzzer_config: Option<config::WorkerConfig>,
     /// In-memory hash set for sync dedup (survives across sync cycles).
     #[clap(skip)]
     sync_hashes: HashSet<u64>,

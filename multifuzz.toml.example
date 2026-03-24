@@ -38,7 +38,11 @@ enabled = true
 # At startup, the resolved env + command is printed per worker.
 #
 # Optional per-worker fields:
+#   args = "..."     # Extra CLI args (power schedule, cmplog, etc.)
 #   command = "..."  # Full command override (executed via sh -c)
+#
+# The auto-generated command is MINIMAL: -M/-S, -i, -o, -t, -G, dicts.
+# Everything else (power schedule, cmplog, old queue) goes in args.
 
 [fuzz.afl.all.env]
 AFL_AUTORESUME = "1"
@@ -51,22 +55,35 @@ AFL_NO_WARN_INSTABILITY = "1"
 AFL_FUZZER_STATS_UPDATE_INTERVAL = "10"
 AFL_IGNORE_SEED_PROBLEMS = "1"
 
-# Main instance: needs AFL_FINAL_SYNC.
+# Main instance.
+[fuzz.afl.worker0]
+args = "-pexplore"
+
 [fuzz.afl.worker0.env]
 AFL_FINAL_SYNC = "1"
 
 # Secondary with custom mutator.
+[fuzz.afl.worker1]
+args = "-pfast"
+
 [fuzz.afl.worker1.env]
 AFL_CUSTOM_MUTATOR_LIBRARY = "~/Sources/AFLplusplus/custom_mutators/radamsa/radamsa-mutator.so"
 AFL_CUSTOM_MUTATOR_ONLY = "1"
 
+# Secondary with cmplog.
+[fuzz.afl.worker2]
+args = "-pcoe -l2a"
+
 # Secondary with grammar mutator.
+[fuzz.afl.worker3]
+args = "-pexploit"
+
 [fuzz.afl.worker3.env]
 AFL_CUSTOM_MUTATOR_LIBRARY = "~/Sources/AFLplusplus/custom_mutators/grammar_mutator/grammar_mutator.so"
 
 # Fully custom command example (uncomment to use):
 # [fuzz.afl.worker3]
-# command = "cargo afl fuzz -Sgrammar -i ../../source_corpus -o ../../output/multi/afl -G8192 ./target/afl/debug/multifuzz_source_fuzzer"
+# command = "cargo afl fuzz -Sgrammar -i ../../source_corpus -o ../../output/multi/afl -pexplore -G8192 ./target/afl/debug/multifuzz_source_fuzzer"
 
 # ── Satellite engines ──────────────────────────────────────────────────
 # Present = enabled. Absent = disabled. Each takes 1 slot from total jobs.
