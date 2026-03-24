@@ -58,7 +58,7 @@ jobs = 4
 corpus = "./corpus"
 output = "./output"
 timeout = 10
-sync_interval = 60
+sync_interval = 60  # min
 dictionaries = ["./dict.dict"]
 
 # Per-worker AFL++ configuration. No hidden defaults — everything explicit.
@@ -86,22 +86,15 @@ AFL_CUSTOM_MUTATOR_LIBRARY = "/path/to/mutator.so"
 ## CLI
 
 ```sh
-# Build all fuzzer binaries (AFL++, honggfuzz, libfuzzer)
+# Build all the required fuzzer binaries
 multifuzz build
 
-# Run campaign (reads multifuzz.toml from cwd, or pass --config <path>)
+# Run campaign
 multifuzz fuzz
 
 # Replay a crash or directory of inputs
 multifuzz run my_target -i output/my_target/crashes/ -r
-
-# Add external inputs to a running fuzzing session
-multifuzz add-corpus my_target -i interesting_inputs/ -r
 ```
-
-## How it works
-
-Jobs are distributed across engines automatically. Corpus files are synchronized between engines periodically using hash-based deduplication. Crashes from all engines are collected into a unified `crashes/` directory.
 
 ## License
 
