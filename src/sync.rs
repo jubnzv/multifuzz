@@ -29,14 +29,14 @@ use twox_hash::XxHash64;
 /// - Atomic write: tmp file + rename
 ///
 /// On first call (`seen_hashes` is empty), seeds it by scanning `source_dirs`.
-/// Returns the newest file mtime seen (pass as `since` on next cycle).
+/// Returns (newest_mtime, files_copied).
 pub fn sync_files(
     source_dirs: &[PathBuf],
     dest_dir: &Path,
     since: Option<SystemTime>,
     max_len: u64,
     seen_hashes: &mut HashSet<u64>,
-) -> Result<Option<SystemTime>> {
+) -> Result<(Option<SystemTime>, usize)> {
     if !dest_dir.exists() {
         fs::create_dir_all(dest_dir)?;
     }
@@ -49,6 +49,7 @@ pub fn sync_files(
     }
 
     let mut newest = since;
+    let mut copied = 0usize;
 
     for dir in source_dirs {
         if !dir.exists() {
@@ -107,6 +108,7 @@ pub fn sync_files(
             if let Ok(mut f) = fs::File::create(&tmp_path) {
                 if f.write_all(&bytes).is_ok() {
                     let _ = fs::rename(&tmp_path, &dest_path);
+                    copied += 1;
                 } else {
                     let _ = fs::remove_file(&tmp_path);
                 }
@@ -114,7 +116,7 @@ pub fn sync_files(
         }
     }
 
-    Ok(newest)
+    Ok((newest, copied))
 }
 
 /// Collect files from external corpus directories, optionally recursive.

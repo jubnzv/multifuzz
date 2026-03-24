@@ -278,16 +278,18 @@ impl Fuzz {
         // 1. External → AFL queue (hongg/libfuzzer→AFL is handled by -F).
         if self.afl_enabled() && !self.external_corpus.is_empty() {
             let mut sources = external.clone();
-            // Deduplicate source dirs.
             sources.sort();
             sources.dedup();
-            if let Ok(t) = crate::sync::sync_files(
+            if let Ok((t, n)) = crate::sync::sync_files(
                 &sources,
                 &afl_queue,
                 last_synced,
                 max_len,
                 &mut self.sync_hashes,
             ) {
+                if n > 0 {
+                    eprintln!("    Sync: {n} files → {}", afl_queue.display());
+                }
                 if t.is_some() {
                     newest = t;
                 }
@@ -301,13 +303,16 @@ impl Fuzz {
                 sources.push(lf_corpus.clone());
             }
             sources.extend(external.iter().cloned());
-            if let Ok(t) = crate::sync::sync_files(
+            if let Ok((t, n)) = crate::sync::sync_files(
                 &sources,
                 &hongg_input,
                 last_synced,
                 max_len,
                 &mut self.sync_hashes,
             ) {
+                if n > 0 {
+                    eprintln!("    Sync: {n} files → {}", hongg_input.display());
+                }
                 if t.is_some() {
                     newest = t;
                 }
@@ -321,13 +326,16 @@ impl Fuzz {
                 sources.push(hongg_corpus.clone());
             }
             sources.extend(external.iter().cloned());
-            if let Ok(t) = crate::sync::sync_files(
+            if let Ok((t, n)) = crate::sync::sync_files(
                 &sources,
                 &lf_corpus,
                 last_synced,
                 max_len,
                 &mut self.sync_hashes,
             ) {
+                if n > 0 {
+                    eprintln!("    Sync: {n} files → {}", lf_corpus.display());
+                }
                 if t.is_some() {
                     newest = t;
                 }
