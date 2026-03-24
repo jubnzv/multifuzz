@@ -2,7 +2,13 @@
 
 Multi-engine fuzzing orchestrator for Rust. Runs AFL++, honggfuzz, and libfuzzer in parallel with automatic corpus synchronization and crash collection.
 
-![screenshot](./docs/img/screenshot.png)
+**Features:**
+1. **Unified Rust API** to set up a harness for all three fuzzers (see below)
+2. **Corpus synchronization** between engines with dynamic input handling. Leverages built-in fuzzer features for synchronization.
+3. **Single configuration file** for all fuzzer instances – everything is 100% explicit; the orchestrator does not introduce any implicit configuration options or environment variables
+4. **No overhead**: no UI, no fancy extra tools, etc.
+
+Overall, it simplifies Rust harness implementation and replaces Makefiles/custom scripts for running complex fuzzing campaigns.
 
 ## Usage
 
