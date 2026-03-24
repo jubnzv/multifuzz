@@ -341,7 +341,7 @@ impl Fuzz {
         let mut newest = last_synced;
 
         // Build source lists per engine.
-        let afl_queue: PathBuf = format!("{}/afl/mainaflfuzzer/queue", self.output_target()).into();
+        let afl_queue: PathBuf = format!("{}/afl/master/queue", self.output_target()).into();
         let hongg_corpus: PathBuf = format!("{}/honggfuzz/corpus", self.output_target()).into();
         let hongg_input: PathBuf =
             format!("{}/honggfuzz/dynamic_input", self.output_target()).into();
@@ -499,7 +499,7 @@ impl Fuzz {
     /// Compute the AFL++ input directory (resume-aware).
     fn afl_input_dir(&self) -> Result<String> {
         let corpus = self.corpus_dir();
-        let afl_queue_dir = format!("{}/afl/mainaflfuzzer/queue", self.output_target());
+        let afl_queue_dir = format!("{}/afl/master/queue", self.output_target());
         let afl_can_resume = Path::new(&afl_queue_dir)
             .read_dir()
             .map(|mut d| d.next().is_some())
@@ -545,7 +545,7 @@ impl Fuzz {
         let afl_input_dir = self.afl_input_dir()?;
         let dict_flags = self.afl_dict_flags();
 
-        let fuzzer_name = format!("-Ssecondaryfuzzer{job_num}");
+        let fuzzer_name = format!("-Sslave{job_num}");
         let target_path = format!("./target/afl/debug/{}", self.target());
 
         let timeout_flag = match self.timeout {
@@ -672,7 +672,7 @@ impl Fuzz {
                 cmds.push(cmd_str.clone());
                 handles.push(Some(child));
             } else {
-                let fuzzer_name = String::from("-Mmainaflfuzzer");
+                let fuzzer_name = String::from("-Mmaster");
 
                 let honggfuzz_sync_flag = if self.honggfuzz_enabled() {
                     format!("-F{}/honggfuzz/corpus", self.output_target())

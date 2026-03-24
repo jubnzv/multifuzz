@@ -1,7 +1,7 @@
 //! Corpus sync directories (all under {output}/{target}/):
 //!
 //! AFL:
-//!   afl/mainaflfuzzer/queue/  — AFL main queue. Source for syncing to other engines.
+//!   afl/master/queue/  — AFL main queue. Source for syncing to other engines.
 //!                               Inbound sync from hongg/libfuzzer is handled by AFL's -F flag.
 //! Honggfuzz:
 //!   honggfuzz/corpus/         — hongg output corpus. Source for syncing FROM hongg.
