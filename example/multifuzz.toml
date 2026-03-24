@@ -1,0 +1,21 @@
+[fuzz]
+target = "example_crash"
+jobs = 3
+corpus = "./corpus"
+output = "./output/multi"
+timeout = 5
+
+[fuzz.afl.all.env]
+AFL_AUTORESUME = "1"
+AFL_FAST_CAL = "1"
+AFL_FORCE_UI = "1"
+AFL_IGNORE_UNKNOWN_ENVS = "1"
+AFL_IGNORE_SEED_PROBLEMS = "1"
+AFL_SKIP_CPUFREQ = "1"
+AFL_NO_AFFINITY = "1"
+
+[fuzz.afl.worker0]
+args = "-pexplore"
+
+[fuzz.afl.worker0.env]
+AFL_FINAL_SYNC = "1"
