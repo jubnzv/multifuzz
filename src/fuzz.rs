@@ -1,4 +1,3 @@
-use crate::ui::ProcessSlot;
 use crate::{config, Build, Fuzz};
 use anyhow::{anyhow, Context, Result};
 use glob::glob;
@@ -219,7 +218,7 @@ impl Fuzz {
     /// Main loop: crash collection, corpus sync, liveness check.
     fn run_loop(
         &mut self,
-        processes: &mut [Option<ProcessSlot>],
+        processes: &mut [Option<process::Child>],
         crash_path: &Path,
     ) -> Result<()> {
         let mut last_synced_created_time: Option<SystemTime> = None;
@@ -262,7 +261,7 @@ impl Fuzz {
             // ── liveness check ──────────────────────────────────────────
             let all_dead = processes.iter_mut().all(|slot| {
                 slot.as_mut()
-                    .is_none_or(|ps| ps.child.try_wait().unwrap_or(None).is_some())
+                    .is_none_or(|ch| ch.try_wait().unwrap_or(None).is_some())
             });
             if all_dead {
                 break;
@@ -424,7 +423,7 @@ impl Fuzz {
 
     // ── spawning ────────────────────────────────────────────────────────
 
-    fn spawn_fuzzers_afl_first(&mut self) -> Result<Vec<Option<ProcessSlot>>> {
+    fn spawn_fuzzers_afl_first(&mut self) -> Result<Vec<Option<process::Child>>> {
         let (a, h, l) = self.allocate_jobs();
         self.spawn_fuzzers_with_allocation(a, h, l)
     }
@@ -434,12 +433,12 @@ impl Fuzz {
         afl_jobs: u32,
         honggfuzz_jobs: u32,
         libfuzzer_jobs: u32,
-    ) -> Result<Vec<Option<ProcessSlot>>> {
+    ) -> Result<Vec<Option<process::Child>>> {
         if afl_jobs == 0 && honggfuzz_jobs == 0 && libfuzzer_jobs == 0 {
             return Err(anyhow!("Pick at least one fuzzer"));
         }
 
-        let mut handles: Vec<Option<ProcessSlot>> = vec![];
+        let mut handles: Vec<Option<process::Child>> = vec![];
         let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
 
         if afl_jobs > 0 {
@@ -653,7 +652,7 @@ impl Fuzz {
         &mut self,
         cargo: &str,
         afl_jobs: u32,
-        handles: &mut Vec<Option<ProcessSlot>>,
+        handles: &mut Vec<Option<process::Child>>,
     ) -> Result<Vec<String>> {
         let afl_input_dir = self.afl_input_dir()?;
         let dict_flags = self.afl_dict_flags();
@@ -672,10 +671,7 @@ impl Fuzz {
             if let Some(command) = worker_cfg.and_then(|c| c.command.as_deref()) {
                 let (child, cmd_str) = self.spawn_afl_custom(job_num, command)?;
                 cmds.push(cmd_str.clone());
-                handles.push(Some(ProcessSlot {
-                    child,
-                    paused: false,
-                }));
+                handles.push(Some(child));
             } else {
                 let fuzzer_name = String::from("-Mmainaflfuzzer");
 
@@ -752,10 +748,7 @@ impl Fuzz {
                     cmd.env(k, v);
                 }
 
-                handles.push(Some(ProcessSlot {
-                    child: cmd.spawn()?,
-                    paused: false,
-                }));
+                handles.push(Some(cmd.spawn()?));
             }
         }
 
@@ -764,10 +757,7 @@ impl Fuzz {
             let (child, sec_cmd_str) = self.spawn_afl_secondary(cargo, job_num)?;
             cmds.push(sec_cmd_str.clone());
 
-            handles.push(Some(ProcessSlot {
-                child,
-                paused: false,
-            }));
+            handles.push(Some(child));
         }
 
         Ok(cmds)
@@ -776,7 +766,7 @@ impl Fuzz {
     fn spawn_honggfuzz(
         &self,
         cargo: &str,
-        handles: &mut Vec<Option<ProcessSlot>>,
+        handles: &mut Vec<Option<process::Child>>,
     ) -> Result<String> {
         let corpus = self.corpus_dir();
         let worker_cfg = self.honggfuzz_config.as_ref();
@@ -853,17 +843,14 @@ impl Fuzz {
             .stdout(hfuzz_log_clone)
             .process_group(0);
 
-        handles.push(Some(ProcessSlot {
-            child: cmd.spawn()?,
-            paused: false,
-        }));
+        handles.push(Some(cmd.spawn()?));
 
         Ok(cmd_str)
     }
 
     fn spawn_libfuzzer(
         &self,
-        handles: &mut Vec<Option<ProcessSlot>>,
+        handles: &mut Vec<Option<process::Child>>,
     ) -> Result<String> {
         let worker_cfg = self.libfuzzer_config.as_ref();
 
@@ -926,11 +913,10 @@ impl Fuzz {
             cmd.env(k, v);
         }
 
-        handles.push(Some(ProcessSlot {
-            child: cmd.spawn()
+        handles.push(Some(
+            cmd.spawn()
                 .with_context(|| format!("Failed to spawn libfuzzer binary: {binary}"))?,
-            paused: false,
-        }));
+        ));
 
         Ok(cmd_str)
     }
@@ -1028,31 +1014,19 @@ fn kill_subprocesses_recursively(pid: &str) -> Result<()> {
     Ok(())
 }
 
-/// Send a signal to an entire process group.
-fn send_signal_to_process_group(pid: u32, signal: libc::c_int) {
-    unsafe {
-        libc::kill(-(pid as i32), signal);
-    }
-}
 
 
-fn stop_fuzzers(processes: &mut [Option<ProcessSlot>]) -> Result<()> {
-    // Send SIGTERM to all workers first.
+fn stop_fuzzers(processes: &mut [Option<process::Child>]) -> Result<()> {
     for slot in processes.iter_mut() {
-        if let Some(ps) = slot.as_mut() {
-            if ps.paused {
-                send_signal_to_process_group(ps.child.id(), libc::SIGCONT);
-            }
-            kill_process_tree(ps.child.id())?;
+        if let Some(child) = slot.as_mut() {
+            kill_process_tree(child.id())?;
         }
     }
-    // Wait for all workers to actually terminate.
     for slot in processes.iter_mut() {
-        if let Some(ps) = slot.as_mut() {
-            let _ = ps.child.wait();
+        if let Some(child) = slot.as_mut() {
+            let _ = child.wait();
         }
     }
-    // Now drop the slots.
     for slot in processes.iter_mut() {
         *slot = None;
     }
