@@ -35,7 +35,10 @@ pub enum Command {
 
 #[derive(clap::Args)]
 pub struct Build {
-    /// Build a separate cmplog-instrumented AFL binary (set internally by fuzz command).
+    /// Path to TOML config file (default: ./multifuzz.toml if present)
+    #[clap(short = 'c', long = "config", value_name = "FILE")]
+    pub config: Option<PathBuf>,
+    /// Build cmplog binary (set internally by fuzz command based on worker configs).
     #[clap(skip)]
     pub afl_cmplog: bool,
 }

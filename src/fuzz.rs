@@ -116,6 +116,7 @@ impl Fuzz {
         self.output = Some(self.output().canonicalize()?);
 
         let build = Build {
+            config: self.config.clone(),
             afl_cmplog: self.needs_cmplog(),
         };
         build.build().context("Failed to build the fuzzers")?;

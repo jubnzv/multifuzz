@@ -1,3 +1,10 @@
+[build]
+# Default build commands. Uncomment to override.
+# afl = "AFL_QUIET=1 cargo afl build --features=multifuzz/afl --target-dir=target/afl"
+# afl_cmplog = "AFL_QUIET=1 AFL_LLVM_CMPLOG=1 cargo afl build --features=multifuzz/afl --target-dir=target/afl-cmplog"
+# honggfuzz = "CARGO_TARGET_DIR=./target/honggfuzz HFUZZ_BUILD_ARGS='--features=multifuzz/honggfuzz' cargo hfuzz build-debug"
+# libfuzzer = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4 -Cllvm-args=-sanitizer-coverage-trace-compares -Cllvm-args=-sanitizer-coverage-inline-8bit-counters -Cllvm-args=-sanitizer-coverage-pc-table' cargo build --release --target=x86_64-unknown-linux-gnu --features=multifuzz/libfuzzer --target-dir=target/libfuzzer"
+
 [fuzz]
 target = "example_crash"
 jobs = 3

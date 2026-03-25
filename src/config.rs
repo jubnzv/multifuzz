@@ -5,7 +5,17 @@ use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Default)]
 pub struct ConfigFile {
+    pub build: Option<BuildConfig>,
     pub fuzz: Option<FuzzConfig>,
+}
+
+#[derive(Deserialize, Default)]
+pub struct BuildConfig {
+    pub no_build: Option<bool>,
+    pub afl: Option<String>,
+    pub afl_cmplog: Option<String>,
+    pub honggfuzz: Option<String>,
+    pub libfuzzer: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
