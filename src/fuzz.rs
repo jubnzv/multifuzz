@@ -12,6 +12,9 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+/// (process handles, worker names + log paths)
+type SpawnResult = (Vec<Option<process::Child>>, Vec<(String, String)>);
+
 /// RAII guard that deletes the lockfile on drop (normal exit, Ctrl-C, all fuzzers dead).
 struct LockGuard {
     _file: File,
@@ -538,7 +541,7 @@ impl Fuzz {
 
     /// Spawn all configured fuzzers. Returns (handles, worker_info) where
     /// worker_info[i] = (name, log_path) for handles[i].
-    fn spawn_fuzzers(&mut self) -> Result<(Vec<Option<process::Child>>, Vec<(String, String)>)> {
+    fn spawn_fuzzers(&mut self) -> Result<SpawnResult> {
         let afl_count = self.afl_worker_count();
         let has_hongg = self.honggfuzz_enabled();
         let has_libfuzzer = self.libfuzzer_enabled();
