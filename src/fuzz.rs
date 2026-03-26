@@ -234,6 +234,27 @@ impl Fuzz {
 
         if self.honggfuzz_enabled() {
             self.check_honggfuzz_oversized_files()?;
+
+            // Seed hongg's dynamic_input with corpus files so it starts with
+            // the same seeds as AFL (which may have grown on previous runs).
+            let hongg_input = format!("{}/honggfuzz/dynamic_input", self.output_target());
+            let mut seeded = 0usize;
+            if let Ok(entries) = fs::read_dir(&corpus) {
+                for entry in entries.flatten() {
+                    let src = entry.path();
+                    if src.is_file() {
+                        let dest =
+                            format!("{}/{}", hongg_input, entry.file_name().to_string_lossy());
+                        if !Path::new(&dest).exists() {
+                            let _ = fs::copy(&src, &dest);
+                            seeded += 1;
+                        }
+                    }
+                }
+            }
+            if seeded > 0 {
+                eprintln!("    Seeded honggfuzz dynamic_input with {seeded} corpus files");
+            }
         }
 
         unsafe {
