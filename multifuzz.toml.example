@@ -3,7 +3,7 @@
 #
 # Equivalent to:
 #   AFL_SKIP_CPUFREQ=1 cargo run --release --manifest-path ~/Dev/multifuzz/Cargo.toml \
-#     -- fuzz multifuzz_source_fuzzer --sync-interval 60 -j 4 \
+#     -- fuzz multifuzz_source_fuzzer --sync-interval 60 \
 #     -i ../../source_corpus -o ../../output/multi \
 #     -x ../../dicts/move.dict -x ../../dicts/move_rare.dict -x ../../dicts/crash.dict \
 #     -t 10 --external-corpus /tmp/move-corpus
@@ -21,7 +21,6 @@
 
 [fuzz]
 target = "multifuzz_source_fuzzer"
-jobs = 4
 corpus = "../../source_corpus"
 output = "../../output/multi"
 timeout = 10

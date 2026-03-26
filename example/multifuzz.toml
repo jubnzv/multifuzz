@@ -7,7 +7,6 @@
 
 [fuzz]
 target = "example_crash"
-jobs = 3
 corpus = "./corpus"
 output = "./output/multi"
 timeout = 5

@@ -51,9 +51,6 @@ pub struct Fuzz {
     /// Path to TOML config file (default: ./multifuzz.toml if present)
     #[clap(short = 'c', long = "config", value_name = "FILE")]
     config: Option<PathBuf>,
-    /// Number of concurrent fuzzing jobs
-    #[clap(short, long, value_name = "NUM")]
-    jobs: Option<u32>,
     /// Shared corpus directory
     #[clap(short = 'i', long = "corpus", value_name = "DIR")]
     corpus: Option<PathBuf>,
@@ -126,7 +123,6 @@ impl Fuzz {
         }
 
         // Fields with defaults: CLI if Some, else TOML, else hardcoded default
-        self.jobs = Some(self.jobs.or(toml.jobs).unwrap_or(1));
         self.max_input_size = Some(
             self.max_input_size
                 .or(toml.max_input_size)
@@ -168,9 +164,6 @@ impl Fuzz {
     }
 
     // Accessors for resolved Option<T> fields (guaranteed Some after resolve_config).
-    pub fn jobs(&self) -> u32 {
-        self.jobs.unwrap()
-    }
     pub fn max_input_size(&self) -> u32 {
         self.max_input_size.unwrap()
     }

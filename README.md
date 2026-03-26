@@ -54,7 +54,6 @@ Campaigns are configured via a TOML file (`multifuzz.toml` by default, or `--con
 ```toml
 [fuzz]
 target = "my_target"
-jobs = 4
 corpus = "./corpus"
 output = "./output"
 timeout = 10

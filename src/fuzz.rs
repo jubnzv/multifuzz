@@ -202,7 +202,7 @@ impl Fuzz {
 
         let loop_start = Instant::now();
 
-        let mut processes = self.spawn_fuzzers_afl_first()?;
+        let mut processes = self.spawn_fuzzers()?;
         self.print_launch_info();
 
         self.run_loop(&mut processes)?;
@@ -394,36 +394,44 @@ impl Fuzz {
 
     // ── spawning ────────────────────────────────────────────────────────
 
-    fn spawn_fuzzers_afl_first(&mut self) -> Result<Vec<Option<process::Child>>> {
-        let (a, h, l) = self.allocate_jobs();
-        self.spawn_fuzzers_with_allocation(a, h, l)
+    /// AFL worker count: derived from config sections.
+    /// If explicit workerN keys exist, count = max key + 1 (so worker0..workerN are spawned).
+    /// If only [fuzz.afl.all] exists (no workerN), spawn 1 worker (master only).
+    fn afl_worker_count(&self) -> u32 {
+        if !self.afl_enabled() {
+            return 0;
+        }
+        if self.afl_worker_configs.is_empty() {
+            1 // just master
+        } else {
+            self.afl_worker_configs.keys().max().unwrap() + 1
+        }
     }
 
-    fn spawn_fuzzers_with_allocation(
-        &mut self,
-        afl_jobs: u32,
-        honggfuzz_jobs: u32,
-        libfuzzer_jobs: u32,
-    ) -> Result<Vec<Option<process::Child>>> {
-        if afl_jobs == 0 && honggfuzz_jobs == 0 && libfuzzer_jobs == 0 {
+    fn spawn_fuzzers(&mut self) -> Result<Vec<Option<process::Child>>> {
+        let afl_count = self.afl_worker_count();
+        let has_hongg = self.honggfuzz_enabled();
+        let has_libfuzzer = self.libfuzzer_enabled();
+
+        if afl_count == 0 && !has_hongg && !has_libfuzzer {
             return Err(anyhow!("Pick at least one fuzzer"));
         }
 
         let mut handles: Vec<Option<process::Child>> = vec![];
         let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
 
-        if afl_jobs > 0 {
+        if afl_count > 0 {
             fs::create_dir_all(format!("{}/afl", self.output_target()))?;
-            self.spawn_afl(&cargo, afl_jobs, &mut handles)?;
-            eprintln!("    Launched AFL++ ({afl_jobs} instances)");
+            self.spawn_afl(&cargo, afl_count, &mut handles)?;
+            eprintln!("    Launched AFL++ ({afl_count} instances)");
         }
 
-        if honggfuzz_jobs > 0 {
+        if has_hongg {
             self.spawn_honggfuzz(&cargo, &mut handles)?;
             eprintln!("    Launched honggfuzz");
         }
 
-        if libfuzzer_jobs > 0 {
+        if has_libfuzzer {
             self.spawn_libfuzzer(&mut handles)?;
             eprintln!("    Launched libfuzzer");
         }
@@ -432,8 +440,8 @@ impl Fuzz {
         let logs_dir = format!("{}/logs", self.output_target());
         eprintln!();
         eprintln!("    Log files:");
-        if afl_jobs > 0 {
-            for i in 0..afl_jobs {
+        if afl_count > 0 {
+            for i in 0..afl_count {
                 let name = if i == 0 {
                     "afl.log".to_string()
                 } else {
@@ -442,30 +450,14 @@ impl Fuzz {
                 eprintln!("      tail -f {logs_dir}/{name}");
             }
         }
-        if honggfuzz_jobs > 0 {
+        if has_hongg {
             eprintln!("      tail -f {logs_dir}/honggfuzz.log");
         }
-        if libfuzzer_jobs > 0 {
+        if has_libfuzzer {
             eprintln!("      tail -f {logs_dir}/libfuzzer.log");
         }
 
         Ok(handles)
-    }
-
-    /// Allocate jobs between AFL++, honggfuzz and libfuzzer.
-    /// Returns (afl_jobs, honggfuzz_slots, libfuzzer_slots).
-    /// Each configured satellite takes 1 slot from the total. AFL gets the rest.
-    /// Internal parallelism (hongg -n, libfuzzer -fork) is in user args.
-    fn allocate_jobs(&self) -> (u32, u32, u32) {
-        let satellites = self.honggfuzz_enabled() as u32 + self.libfuzzer_enabled() as u32;
-        let afl_jobs = if self.afl_enabled() {
-            self.jobs().saturating_sub(satellites)
-        } else {
-            0
-        };
-        let h = self.honggfuzz_enabled() as u32;
-        let l = self.libfuzzer_enabled() as u32;
-        (afl_jobs, h, l)
     }
 
     /// Compute the AFL++ input directory (resume-aware).

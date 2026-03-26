@@ -21,7 +21,6 @@ pub struct BuildConfig {
 #[derive(Deserialize, Default)]
 pub struct FuzzConfig {
     pub target: Option<String>,
-    pub jobs: Option<u32>,
     pub corpus: Option<PathBuf>,
     pub output: Option<PathBuf>,
     pub timeout: Option<u32>,
