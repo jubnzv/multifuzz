@@ -665,7 +665,11 @@ impl Fuzz {
             cmd.env(k, v);
         }
 
-        let label = if job_num == 0 { "AFL master".to_string() } else { format!("AFL slave{job_num}") };
+        let label = if job_num == 0 {
+            "AFL master".to_string()
+        } else {
+            format!("AFL slave{job_num}")
+        };
         log_worker(&format!("{label} (custom)"), &env_vars, command);
 
         Ok((cmd.spawn()?, command.to_string()))
