@@ -70,8 +70,7 @@ impl Build {
         let build_cfg = cfg.build.unwrap_or_default();
         let fuzz_cfg = cfg.fuzz.unwrap_or_default();
 
-        if build_cfg.no_build.unwrap_or(false) {
-            eprintln!("    Skipping build (no_build = true)");
+        if !self.force && !build_cfg.always_build.unwrap_or(false) {
             return Ok(());
         }
 

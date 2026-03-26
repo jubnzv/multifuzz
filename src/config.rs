@@ -11,7 +11,7 @@ pub struct ConfigFile {
 
 #[derive(Deserialize, Default)]
 pub struct BuildConfig {
-    pub no_build: Option<bool>,
+    pub always_build: Option<bool>,
     pub afl: Option<String>,
     pub afl_cmplog: Option<String>,
     pub honggfuzz: Option<String>,

@@ -41,6 +41,9 @@ pub struct Build {
     /// Build cmplog binary (set internally by fuzz command based on worker configs).
     #[clap(skip)]
     pub afl_cmplog: bool,
+    /// Force build regardless of always_build config (set for standalone `multifuzz build`).
+    #[clap(skip)]
+    pub force: bool,
 }
 
 #[derive(clap::Args)]
@@ -202,7 +205,10 @@ pub struct Run {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Build(args) => args.build().context("Failed to build the fuzzers"),
+        Command::Build(mut args) => {
+            args.force = true;
+            args.build().context("Failed to build the fuzzers")
+        }
         Command::Fuzz(mut args) => args.fuzz().context("Failure running fuzzers"),
         Command::Run(args) => args.run().context("Failure running inputs"),
     }
