@@ -12,6 +12,18 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+/// RAII guard that deletes the lockfile on drop (normal exit, Ctrl-C, all fuzzers dead).
+struct LockGuard {
+    _file: File,
+    path: String,
+}
+
+impl Drop for LockGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 /// Print per-worker configuration to stderr.
 fn log_afl_worker(job_num: u32, label: &str, env_vars: &BTreeMap<String, String>, cmd: &str) {
     eprintln!("    -- AFL worker {job_num} ({label}) --");
@@ -160,6 +172,22 @@ impl Fuzz {
         // Resolve output to an absolute path so all printed paths are absolute.
         fs::create_dir_all(self.output())?;
         self.output = Some(self.output().canonicalize()?);
+
+        // Lockfile: ensure only one multifuzz instance per output dir.
+        let lock_path = format!("{}/.multifuzz.lock", self.output_target());
+        fs::create_dir_all(self.output_target())?;
+        let lock_file = File::create(&lock_path)
+            .with_context(|| format!("Failed to create lockfile: {lock_path}"))?;
+        use std::os::unix::io::AsRawFd;
+        if unsafe { libc::flock(lock_file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(anyhow!(
+                "Another multifuzz instance is already running (lockfile: {lock_path})"
+            ));
+        }
+        let _lock_guard = LockGuard {
+            _file: lock_file,
+            path: lock_path,
+        };
 
         let build = Build {
             config: self.config.clone(),
