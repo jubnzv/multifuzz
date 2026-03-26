@@ -17,7 +17,7 @@ pub const DEFAULT_MAX_INPUT_SIZE: u32 = 8192;
 #[derive(Parser)]
 #[clap(
     name = "multifuzz",
-    version,
+    version = concat!(env!("CARGO_PKG_VERSION"), " (", env!("GIT_HASH"), " ", env!("GIT_DATE"), ")"),
     about = "Multi-engine fuzzer orchestrator"
 )]
 pub struct Cli {
