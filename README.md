@@ -1,16 +1,35 @@
 # multifuzz
 
-Multi-engine fuzzing orchestrator for Rust. Runs AFL++, honggfuzz, and libfuzzer in parallel with automatic corpus synchronization and crash collection.
+Multi-engine fuzzing orchestrator for Rust. Runs AFL++, honggfuzz, and libfuzzer in parallel with automatic corpus synchronization.
 
 **Features:**
 1. **Unified Rust API** to set up a harness for all three fuzzers (see below)
 2. **Corpus synchronization** between engines with dynamic input handling. Leverages built-in fuzzer features for synchronization.
-3. **Single configuration file** for all fuzzer instances – everything is 100% explicit; the orchestrator does not introduce any implicit configuration options or environment variables
-4. **No overhead**: no UI, no fancy extra tools, etc.
+3. **Single configuration file** for all fuzzer instances — everything is 100% explicit; the orchestrator does not introduce any implicit configuration options or environment variables
+4. **No overhead**: no UI, no extra tools
 
-Overall, it simplifies Rust harness implementation and replaces Makefiles/custom scripts for running complex fuzzing campaigns.
+Simplifies Rust harness implementation and replaces Makefiles/custom scripts for running complex fuzzing campaigns.
+
+## Installation
+
+Install the fuzzing toolchains you are going to use:
+
+```sh
+cargo install cargo-afl
+cargo install honggfuzz
+```
+
+Then clone the repository and install the `multifuzz` binary:
+
+```sh
+git clone https://github.com/jubnzv/multifuzz
+cd multifuzz
+cargo install --path .
+```
 
 ## Usage
+
+### 1. Create the fuzzing harness
 
 Write a fuzz harness using the `fuzz!` macro:
 
@@ -32,22 +51,7 @@ fuzz!(|data: MyStruct| {
 });
 ```
 
-## Prerequisites
-
-Install the fuzzing toolchains:
-
-```sh
-cargo install cargo-afl
-cargo install honggfuzz
-```
-
-## Installation
-
-```sh
-cargo install --path path/to/multifuzz
-```
-
-## Configuration
+### 2. Write a configuration file
 
 Campaigns are configured via a TOML file (`multifuzz.toml` by default, or `--config <path>`). See `multifuzz.toml.example` for a full reference.
 
@@ -82,23 +86,30 @@ AFL_FINAL_SYNC = "1"
 AFL_CUSTOM_MUTATOR_LIBRARY = "/path/to/mutator.so"
 ```
 
-## CLI
+### 3. Use CLI to start and manage the campaign
 
 ```sh
-# Build all the required fuzzer binaries
+# Build all fuzzer binaries
 multifuzz build
 
-# Run campaign
+# Run the campaign
 multifuzz fuzz
+
+# List running workers
+multifuzz worker ps
+
+# Kill a specific worker
+multifuzz worker kill slave1
+
+# Start a stopped worker
+multifuzz worker start slave1
+
+# Clean up artifacts (lockfile, temp files, output)
+multifuzz clean
 
 # Replay a crash or directory of inputs
 multifuzz run my_target -i output/my_target/afl/master/crashes/ -r
 ```
-
-Crashes are written by each engine to its own directory. Locations are printed at startup:
-- AFL: `{output}/{target}/afl/*/crashes/`
-- honggfuzz: `{output}/{target}/honggfuzz/{target}/`
-- libfuzzer: `{output}/{target}/libfuzzer/crashes/`
 
 ## License
 
