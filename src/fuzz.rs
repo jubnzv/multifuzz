@@ -25,8 +25,8 @@ impl Drop for LockGuard {
 }
 
 /// Print per-worker configuration to stderr.
-fn log_afl_worker(job_num: u32, label: &str, env_vars: &BTreeMap<String, String>, cmd: &str) {
-    eprintln!("    -- AFL worker {job_num} ({label}) --");
+fn log_worker(name: &str, env_vars: &BTreeMap<String, String>, cmd: &str) {
+    eprintln!("    -- {name} --");
     if env_vars.is_empty() {
         eprintln!("    (no env vars configured)");
     } else {
@@ -629,7 +629,7 @@ impl Fuzz {
         cmd_parts.extend(dict_flags.iter().map(|s| s.as_str()));
         cmd_parts.push(&target_path);
         let cmd_str = cmd_parts.join(" ");
-        log_afl_worker(job_num, "secondary", &env_vars, &cmd_str);
+        log_worker(&format!("AFL slave{job_num}"), &env_vars, &cmd_str);
 
         Ok((cmd.spawn()?, cmd_str))
     }
@@ -665,7 +665,8 @@ impl Fuzz {
             cmd.env(k, v);
         }
 
-        log_afl_worker(job_num, "custom", &env_vars, command);
+        let label = if job_num == 0 { "AFL master".to_string() } else { format!("AFL slave{job_num}") };
+        log_worker(&format!("{label} (custom)"), &env_vars, command);
 
         Ok((cmd.spawn()?, command.to_string()))
     }
@@ -763,7 +764,7 @@ impl Fuzz {
                 cmd_parts.push(&target_path);
                 let main_cmd_str = cmd_parts.join(" ");
                 cmds.push(main_cmd_str.clone());
-                log_afl_worker(job_num, "main", &env_vars, &main_cmd_str);
+                log_worker("AFL master", &env_vars, &main_cmd_str);
 
                 let mut cmd = process::Command::new(cargo);
                 cmd.args(&afl_args)
@@ -851,7 +852,7 @@ impl Fuzz {
             "script --flush --quiet -c \"{cargo} hfuzz run {}\" /dev/null",
             self.target(),
         );
-        log_afl_worker(0, "honggfuzz", &env_vars, &cmd_str);
+        log_worker("honggfuzz", &env_vars, &cmd_str);
 
         let hfuzz_log = File::create(format!("{}/logs/honggfuzz.log", self.output_target()))?;
         let hfuzz_log_clone = hfuzz_log.try_clone()?;
@@ -923,7 +924,7 @@ impl Fuzz {
             .unwrap_or_default();
 
         let cmd_str = format!("{binary} {}", args.join(" "));
-        log_afl_worker(0, "libfuzzer", &env_vars, &cmd_str);
+        log_worker("libfuzzer", &env_vars, &cmd_str);
 
         let lf_log = File::create(format!("{}/logs/libfuzzer.log", self.output_target()))?;
         let lf_log_clone = lf_log.try_clone()?;
