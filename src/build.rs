@@ -68,25 +68,44 @@ impl Build {
     pub fn build(&self) -> Result<()> {
         let cfg = config::load_config(self.config.as_deref())?;
         let build_cfg = cfg.build.unwrap_or_default();
+        let fuzz_cfg = cfg.fuzz.unwrap_or_default();
 
         if build_cfg.no_build.unwrap_or(false) {
             eprintln!("    Skipping build (no_build = true)");
             return Ok(());
         }
 
-        let afl_cmd = build_cfg.afl.unwrap_or_else(default_afl_cmd);
-        run_build_step("afl", &afl_cmd)?;
+        let has_afl = fuzz_cfg.afl.is_some();
+        let has_hongg = fuzz_cfg
+            .honggfuzz
+            .as_ref()
+            .and_then(|h| h.worker.as_ref())
+            .is_some();
+        let has_libfuzzer = fuzz_cfg
+            .libfuzzer
+            .as_ref()
+            .and_then(|l| l.worker.as_ref())
+            .is_some();
 
-        if self.afl_cmplog {
-            let cmplog_cmd = build_cfg.afl_cmplog.unwrap_or_else(default_afl_cmplog_cmd);
-            run_build_step("afl (cmplog)", &cmplog_cmd)?;
+        if has_afl {
+            let afl_cmd = build_cfg.afl.unwrap_or_else(default_afl_cmd);
+            run_build_step("afl", &afl_cmd)?;
+
+            if self.afl_cmplog {
+                let cmplog_cmd = build_cfg.afl_cmplog.unwrap_or_else(default_afl_cmplog_cmd);
+                run_build_step("afl (cmplog)", &cmplog_cmd)?;
+            }
         }
 
-        let hongg_cmd = build_cfg.honggfuzz.unwrap_or_else(default_honggfuzz_cmd);
-        run_build_step("honggfuzz", &hongg_cmd)?;
+        if has_hongg {
+            let hongg_cmd = build_cfg.honggfuzz.unwrap_or_else(default_honggfuzz_cmd);
+            run_build_step("honggfuzz", &hongg_cmd)?;
+        }
 
-        let lf_cmd = build_cfg.libfuzzer.unwrap_or_else(default_libfuzzer_cmd);
-        run_build_step("libfuzzer", &lf_cmd)?;
+        if has_libfuzzer {
+            let lf_cmd = build_cfg.libfuzzer.unwrap_or_else(default_libfuzzer_cmd);
+            run_build_step("libfuzzer", &lf_cmd)?;
+        }
 
         Ok(())
     }

@@ -98,6 +98,52 @@ impl Fuzz {
         })
     }
 
+    fn afl_binary_path(&self) -> String {
+        let cfg = config::load_config(self.config.as_deref()).ok();
+        let cmd = cfg
+            .as_ref()
+            .and_then(|c| c.build.as_ref())
+            .and_then(|b| b.afl.as_deref())
+            .unwrap_or("");
+        let profile = if cmd.contains("--release") {
+            "release"
+        } else {
+            "debug"
+        };
+        format!("./target/afl/{profile}/{}", self.target())
+    }
+
+    fn afl_cmplog_binary_path(&self) -> String {
+        let cfg = config::load_config(self.config.as_deref()).ok();
+        let cmd = cfg
+            .as_ref()
+            .and_then(|c| c.build.as_ref())
+            .and_then(|b| b.afl_cmplog.as_deref())
+            .unwrap_or("");
+        let profile = if cmd.contains("--release") {
+            "release"
+        } else {
+            "debug"
+        };
+        format!("./target/afl-cmplog/{profile}/{}", self.target())
+    }
+
+    fn libfuzzer_binary_path(&self) -> String {
+        let host = std::env::consts::ARCH.to_string() + "-unknown-" + std::env::consts::OS + "-gnu";
+        let cfg = config::load_config(self.config.as_deref()).ok();
+        let cmd = cfg
+            .as_ref()
+            .and_then(|c| c.build.as_ref())
+            .and_then(|b| b.libfuzzer.as_deref())
+            .unwrap_or("--release");
+        let profile = if cmd.contains("--release") {
+            "release"
+        } else {
+            "debug"
+        };
+        format!("./target/libfuzzer/{host}/{profile}/{}", self.target())
+    }
+
     // ── public entry point ──────────────────────────────────────────────
 
     pub fn fuzz(&mut self) -> Result<()> {
@@ -472,7 +518,7 @@ impl Fuzz {
         let dict_flags = self.afl_dict_flags();
 
         let fuzzer_name = format!("-Sslave{job_num}");
-        let target_path = format!("./target/afl/debug/{}", self.target());
+        let target_path = self.afl_binary_path();
 
         let timeout_flag = match self.timeout {
             Some(t) => format!("-t{}", t * 1000),
@@ -508,7 +554,7 @@ impl Fuzz {
                 .split_whitespace()
                 .any(|a| a.starts_with("-l") && a.len() > 2 && a.as_bytes()[2].is_ascii_digit());
             if has_cmplog {
-                afl_args.push(format!("-c./target/afl-cmplog/debug/{}", self.target()));
+                afl_args.push(format!("-c{}", self.afl_cmplog_binary_path()));
             }
             afl_args.extend(extra.split_whitespace().map(|s| s.to_string()));
         }
@@ -629,7 +675,7 @@ impl Fuzz {
                         .into()
                 };
 
-                let target_path = format!("./target/afl/debug/{}", self.target());
+                let target_path = self.afl_binary_path();
 
                 // Minimal auto-generated args. User adds power schedule etc. via `args`.
                 let mut afl_args: Vec<String> = [
@@ -653,7 +699,7 @@ impl Fuzz {
                         a.starts_with("-l") && a.len() > 2 && a.as_bytes()[2].is_ascii_digit()
                     });
                     if has_cmplog {
-                        afl_args.push(format!("-c./target/afl-cmplog/debug/{}", self.target()));
+                        afl_args.push(format!("-c{}", self.afl_cmplog_binary_path()));
                     }
                     afl_args.extend(extra.split_whitespace().map(|s| s.to_string()));
                 }
@@ -790,9 +836,7 @@ impl Fuzz {
         let worker_cfg = self.libfuzzer_config.as_ref();
 
         // The libfuzzer binary is built with --target=<triple> to isolate
-        // SanitizerCoverage flags from build scripts.
-        let host = std::env::consts::ARCH.to_string() + "-unknown-" + std::env::consts::OS + "-gnu";
-        let binary = format!("./target/libfuzzer/{host}/release/{}", self.target());
+        let binary = self.libfuzzer_binary_path();
         let corpus = self.corpus_dir();
 
         let mut args = vec![
