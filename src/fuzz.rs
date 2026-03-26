@@ -396,11 +396,16 @@ impl Fuzz {
         eprintln!();
         if !self.sync_enabled() {
             if needs_sync {
+                let cfg_path = self
+                    .config
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "./multifuzz.toml".to_string());
                 if has_external {
-                    log!("{}WARNING{}: external corpus configured but sync is disabled (sync_interval = 0)", c_bold_orange(), c_reset());
+                    log!("{}WARNING{}: external corpus configured but sync is disabled. Set sync_interval in {cfg_path}", c_bold_orange(), c_reset());
                 }
                 if has_hongg || has_libfuzzer {
-                    log!("{}WARNING{}: satellite engines configured but sync is disabled — no cross-engine corpus sharing", c_bold_orange(), c_reset());
+                    log!("{}WARNING{}: satellite engines configured but sync is disabled — no cross-engine corpus sharing. Set sync_interval in {cfg_path}", c_bold_orange(), c_reset());
                 }
             }
             log!("Synchronization: {}disabled{}", c_bold_red(), c_reset());
