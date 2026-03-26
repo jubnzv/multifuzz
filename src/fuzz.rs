@@ -93,15 +93,15 @@ macro_rules! log_inline {
 
 /// Print per-worker configuration to stderr.
 fn log_worker(name: &str, env_vars: &BTreeMap<String, String>, cmd: &str) {
-    eprintln!("    -- {name} --");
+    eprintln!("-- {name} --");
     if env_vars.is_empty() {
-        eprintln!("    (no env vars configured)");
+        eprintln!("(no env vars configured)");
     } else {
         for (k, v) in env_vars {
-            eprintln!("    env {k}={v}");
+            eprintln!("env {k}={v}");
         }
     }
-    eprintln!("    $ {cmd}");
+    eprintln!("$ {cmd}");
     eprintln!();
 }
 
@@ -366,25 +366,22 @@ impl Fuzz {
 
     fn print_launch_info(&self) {
         eprintln!();
-        eprintln!("    Crashes:");
+        eprintln!("Crashes:");
         if self.afl_enabled() {
-            eprintln!("      AFL:       {}/afl/*/crashes/", self.output_target());
+            eprintln!("  AFL:       {}/afl/*/crashes/", self.output_target());
         }
         if self.honggfuzz_enabled() {
             eprintln!(
-                "      honggfuzz: {}/honggfuzz/{}/",
+                "  honggfuzz: {}/honggfuzz/{}/",
                 self.output_target(),
                 self.target()
             );
         }
         if self.libfuzzer_enabled() {
-            eprintln!(
-                "      libfuzzer: {}/libfuzzer/crashes/",
-                self.output_target()
-            );
+            eprintln!("  libfuzzer: {}/libfuzzer/crashes/", self.output_target());
         }
         for dir in &self.external_corpus {
-            eprintln!("    External corpus: {}", dir.display());
+            eprintln!("External corpus: {}", dir.display());
         }
 
         // Sync status.
@@ -393,7 +390,6 @@ impl Fuzz {
         let has_libfuzzer = self.libfuzzer_enabled();
         let needs_sync = has_external || has_hongg || has_libfuzzer;
 
-        eprintln!();
         if !self.sync_enabled() {
             if needs_sync {
                 let cfg_path = self
@@ -423,13 +419,13 @@ impl Fuzz {
                 c_reset()
             );
             if has_external && self.afl_enabled() {
-                eprintln!("      external → AFL");
+                eprintln!("  external → AFL");
             }
             if has_hongg {
-                eprintln!("      AFL → honggfuzz");
+                eprintln!("  AFL → honggfuzz");
             }
             if has_libfuzzer {
-                eprintln!("      AFL → libfuzzer");
+                eprintln!("  AFL → libfuzzer");
             }
         }
     }
@@ -694,9 +690,10 @@ impl Fuzz {
         }
 
         eprintln!();
-        eprintln!("    Log files:");
+        eprintln!();
+        eprintln!("Log files:");
         for (_, log) in &worker_info {
-            eprintln!("      tail -f {log}");
+            eprintln!("  tail -f {log}");
         }
 
         Ok((handles, worker_info))
@@ -1153,7 +1150,7 @@ impl Fuzz {
         }
         if !oversized.is_empty() {
             eprintln!(
-                "    Warning: {} file(s) exceed max_input_size ({} bytes) and will crash honggfuzz.",
+                "Warning: {} file(s) exceed max_input_size ({} bytes) and will crash honggfuzz.",
                 oversized.len(),
                 self.max_input_size(),
             );
@@ -1167,7 +1164,7 @@ impl Fuzz {
                 *by_dir.entry(dir).or_default() += 1;
             }
             for (dir, count) in &by_dir {
-                eprintln!("      {count} file(s) in {dir}");
+                eprintln!("{count} file(s) in {dir}");
             }
             eprint!("Remove these copies? (originals are not affected) [Y/n] ");
             let mut answer = String::new();
@@ -1177,9 +1174,9 @@ impl Fuzz {
                 for path in &oversized {
                     let _ = fs::remove_file(path);
                 }
-                eprintln!("    Removed {} oversized file(s).", oversized.len());
+                eprintln!("Removed {} oversized file(s).", oversized.len());
             } else {
-                eprintln!("    Skipped removal. Honggfuzz may abort on oversized inputs.");
+                eprintln!("Skipped removal. Honggfuzz may abort on oversized inputs.");
             }
         }
         Ok(())
