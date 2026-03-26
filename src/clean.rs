@@ -30,13 +30,26 @@ impl Clean {
 
         let mut cleaned = false;
 
-        // Step 1: Lockfile.
+        // Step 1: Lockfile + state file.
         let lock_path = format!("{output_target}/.multifuzz.lock");
-        if Path::new(&lock_path).exists() {
-            eprintln!("Found lockfile: {lock_path}");
+        let state_path = format!("{output_target}/.multifuzz.state");
+        let has_lock = Path::new(&lock_path).exists();
+        let has_state = Path::new(&state_path).exists();
+        if has_lock || has_state {
+            if has_lock {
+                eprintln!("Found lockfile: {lock_path}");
+            }
+            if has_state {
+                eprintln!("Found state file: {state_path}");
+            }
             eprintln!("Ensure no multifuzz instance is running!");
-            if prompt("Remove lockfile?") {
-                fs::remove_file(&lock_path)?;
+            if prompt("Remove?") {
+                if has_lock {
+                    let _ = fs::remove_file(&lock_path);
+                }
+                if has_state {
+                    let _ = fs::remove_file(&state_path);
+                }
                 eprintln!("Removed.");
                 cleaned = true;
             }

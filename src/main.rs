@@ -4,6 +4,7 @@ mod config;
 mod fuzz;
 mod run;
 mod sync;
+mod worker;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
@@ -32,6 +33,8 @@ pub enum Command {
     Fuzz(Box<Fuzz>),
     /// Clean up fuzzing artifacts (lockfile, temp files, output)
     Clean(Clean),
+    /// Manage individual workers (ps, start, kill)
+    Worker(Worker),
     /// Run specific inputs through the runner binary
     Run(Run),
 }
@@ -200,6 +203,31 @@ pub struct Clean {
 }
 
 #[derive(clap::Args)]
+pub struct Worker {
+    /// Path to TOML config file (default: ./multifuzz.toml if present)
+    #[clap(short = 'c', long = "config", value_name = "FILE")]
+    pub config: Option<PathBuf>,
+    #[clap(subcommand)]
+    pub command: WorkerCommand,
+}
+
+#[derive(Subcommand)]
+pub enum WorkerCommand {
+    /// List running and stopped workers
+    Ps,
+    /// Start or restart a worker by name
+    Start {
+        /// Worker name (partial match OK, e.g. "slave1", "hongg")
+        name: String,
+    },
+    /// Kill a worker by name (SIGTERM)
+    Kill {
+        /// Worker name (partial match OK, e.g. "slave1", "hongg")
+        name: String,
+    },
+}
+
+#[derive(clap::Args)]
 pub struct Run {
     /// Target binary name
     #[clap(value_name = "TARGET")]
@@ -221,6 +249,7 @@ fn main() -> Result<()> {
         }
         Command::Fuzz(mut args) => args.fuzz().context("Failure running fuzzers"),
         Command::Clean(args) => args.clean().context("Failure cleaning artifacts"),
+        Command::Worker(args) => args.run().context("Failure managing workers"),
         Command::Run(args) => args.run().context("Failure running inputs"),
     }
 }

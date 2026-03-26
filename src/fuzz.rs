@@ -337,6 +337,17 @@ impl Fuzz {
         let loop_start = Instant::now();
 
         let (mut processes, worker_info) = self.spawn_fuzzers()?;
+
+        // Write state file for `multifuzz worker ps/kill`.
+        let state_entries: Vec<(String, u32, String)> = processes
+            .iter()
+            .zip(worker_info.iter())
+            .filter_map(|(proc, (name, log))| {
+                proc.as_ref().map(|ch| (name.clone(), ch.id(), log.clone()))
+            })
+            .collect();
+        crate::worker::write_state(&self.output_target(), &state_entries);
+
         self.print_launch_info();
         log!("Fuzzing campaign started");
 
@@ -479,11 +490,13 @@ impl Fuzz {
 
             // ── liveness check ──────────────────────────────────────────
             let mut all_dead = true;
+            let mut state_changed = false;
             for (i, slot) in processes.iter_mut().enumerate() {
                 if let Some(child) = slot.as_mut() {
                     match child.try_wait() {
                         Ok(Some(status)) if !reported_dead[i] => {
                             reported_dead[i] = true;
+                            state_changed = true;
                             let (name, log) = &worker_info[i];
                             let code = status
                                 .code()
@@ -501,6 +514,20 @@ impl Fuzz {
                         _ => {}
                     }
                 }
+            }
+            if state_changed {
+                let alive: Vec<(String, u32, String)> = processes
+                    .iter()
+                    .zip(worker_info.iter())
+                    .zip(reported_dead.iter())
+                    .filter_map(|((proc, (name, log)), &dead)| {
+                        if dead {
+                            return None;
+                        }
+                        proc.as_ref().map(|ch| (name.clone(), ch.id(), log.clone()))
+                    })
+                    .collect();
+                crate::worker::write_state(&self.output_target(), &alive);
             }
             if all_dead {
                 break;
