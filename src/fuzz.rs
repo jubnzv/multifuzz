@@ -27,17 +27,68 @@ impl Drop for LockGuard {
     }
 }
 
-fn now_hms() -> String {
-    let secs = SystemTime::now()
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    // Convert to local time via libc.
-    let t = unsafe {
-        let t = secs as libc::time_t;
-        *libc::localtime(&t)
-    };
-    format!("{:02}:{:02}:{:02}", t.tm_hour, t.tm_min, t.tm_sec)
+static NO_COLORS: AtomicBool = AtomicBool::new(false);
+
+// ANSI escape codes.
+fn c_reset() -> &'static str {
+    if NO_COLORS.load(Ordering::Relaxed) {
+        ""
+    } else {
+        "\x1b[0m"
+    }
+}
+fn c_bold_red() -> &'static str {
+    if NO_COLORS.load(Ordering::Relaxed) {
+        ""
+    } else {
+        "\x1b[1;31m"
+    }
+}
+fn c_bold_orange() -> &'static str {
+    if NO_COLORS.load(Ordering::Relaxed) {
+        ""
+    } else {
+        "\x1b[1;33m"
+    }
+}
+fn c_bold_green() -> &'static str {
+    if NO_COLORS.load(Ordering::Relaxed) {
+        ""
+    } else {
+        "\x1b[1;32m"
+    }
+}
+
+/// Timestamped log to stderr: `[HH:MM:SS] message`.
+macro_rules! log {
+    ($($arg:tt)*) => {{
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let t = unsafe {
+            let t = secs as libc::time_t;
+            *libc::localtime(&t)
+        };
+        eprint!("[{:02}:{:02}:{:02}] ", t.tm_hour, t.tm_min, t.tm_sec);
+        eprintln!($($arg)*);
+    }};
+}
+
+/// Timestamped eprint (no newline) for inline sync messages.
+macro_rules! log_inline {
+    ($($arg:tt)*) => {{
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let t = unsafe {
+            let t = secs as libc::time_t;
+            *libc::localtime(&t)
+        };
+        eprint!("[{:02}:{:02}:{:02}] ", t.tm_hour, t.tm_min, t.tm_sec);
+        eprint!($($arg)*);
+    }};
 }
 
 /// Print per-worker configuration to stderr.
@@ -58,6 +109,14 @@ static STOP: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigint(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
+    // write() is async-signal-safe; eprintln!/log! are not.
+    let _ = unsafe {
+        libc::write(
+            2,
+            b"\nGracefully terminating...\n".as_ptr() as *const libc::c_void,
+            26,
+        )
+    };
 }
 
 use std::os::unix::process::CommandExt;
@@ -180,8 +239,9 @@ impl Fuzz {
             .as_deref()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "./multifuzz.toml".to_string());
-        eprintln!("    Loading config from {config_path}");
         self.resolve_config()?;
+        NO_COLORS.store(self.no_colors, Ordering::Relaxed);
+        log!("Loading config from {config_path}");
 
         // target is required
         if self.target.is_none() {
@@ -261,7 +321,7 @@ impl Fuzz {
                 }
             }
             if seeded > 0 {
-                eprintln!("    Seeded honggfuzz input with {seeded} corpus files");
+                log!("Seeded honggfuzz input with {seeded} corpus files");
             }
         }
 
@@ -277,6 +337,7 @@ impl Fuzz {
 
         let (mut processes, worker_info) = self.spawn_fuzzers()?;
         self.print_launch_info();
+        log!("Fuzzing campaign started");
 
         self.run_loop(&mut processes, &worker_info)?;
 
@@ -298,7 +359,7 @@ impl Fuzz {
         };
 
         eprintln!();
-        eprintln!("── Session complete ({runtime}) ──");
+        log!("Session complete ({runtime})");
 
         Ok(())
     }
@@ -336,18 +397,26 @@ impl Fuzz {
         if !self.sync_enabled() {
             if needs_sync {
                 if has_external {
-                    eprintln!("    WARNING: external corpus configured but sync is disabled (sync_interval = 0)");
+                    log!("{}WARNING{}: external corpus configured but sync is disabled (sync_interval = 0)", c_bold_orange(), c_reset());
                 }
                 if has_hongg || has_libfuzzer {
-                    eprintln!("    WARNING: satellite engines configured but sync is disabled — no cross-engine corpus sharing");
+                    log!("{}WARNING{}: satellite engines configured but sync is disabled — no cross-engine corpus sharing", c_bold_orange(), c_reset());
                 }
             }
-            eprintln!("    Synchronization: disabled");
+            log!("Synchronization: {}disabled{}", c_bold_red(), c_reset());
         } else if !needs_sync {
-            eprintln!("    Synchronization: disabled (nothing to sync)");
+            log!(
+                "Synchronization: {}disabled{} (nothing to sync)",
+                c_bold_red(),
+                c_reset()
+            );
         } else {
             let mins = self.sync_interval();
-            eprintln!("    Synchronization every {mins}min:");
+            log!(
+                "Synchronization: {}every {mins}min{}",
+                c_bold_green(),
+                c_reset()
+            );
             if has_external && self.afl_enabled() {
                 eprintln!("      external → AFL");
             }
@@ -418,7 +487,11 @@ impl Fuzz {
                                 .code()
                                 .map(|c| c.to_string())
                                 .unwrap_or_else(|| "signal".to_string());
-                            eprintln!("    {name} exited (code={code}), log: {log}");
+                            log!(
+                                "{}{name} exited (code={code}){}, log: {log}",
+                                c_bold_red(),
+                                c_reset()
+                            );
                         }
                         Ok(None) => {
                             all_dead = false;
@@ -469,7 +542,7 @@ impl Fuzz {
             let mut sources = external.clone();
             sources.sort();
             sources.dedup();
-            eprint!("    [{}] Syncing external → AFL ... ", now_hms());
+            log_inline!("Syncing external → AFL ... ");
             match crate::sync::sync_files(
                 &sources,
                 &afl_queue,
@@ -498,7 +571,7 @@ impl Fuzz {
                 sources.push(lf_corpus.clone());
             }
             sources.extend(external.iter().cloned());
-            eprint!("    [{}] Syncing AFL → honggfuzz ... ", now_hms());
+            log_inline!("Syncing AFL → honggfuzz ... ");
             match crate::sync::sync_files(
                 &sources,
                 &hongg_input,
@@ -527,7 +600,7 @@ impl Fuzz {
                 sources.push(hongg_corpus.clone());
             }
             sources.extend(external.iter().cloned());
-            eprint!("    [{}] Syncing AFL → libfuzzer ... ", now_hms());
+            log_inline!("Syncing AFL → libfuzzer ... ");
             match crate::sync::sync_files(
                 &sources,
                 &lf_corpus,
@@ -600,19 +673,19 @@ impl Fuzz {
                 };
                 worker_info.push((name, log));
             }
-            eprintln!("    Launched AFL++ ({afl_count} instances)");
+            log!("Launched AFL++ ({afl_count} instances)");
         }
 
         if has_hongg {
             self.spawn_honggfuzz(&cargo, &mut handles)?;
             worker_info.push(("honggfuzz".to_string(), format!("{logs_dir}/honggfuzz.log")));
-            eprintln!("    Launched honggfuzz");
+            log!("Launched honggfuzz");
         }
 
         if has_libfuzzer {
             self.spawn_libfuzzer(&mut handles)?;
             worker_info.push(("libfuzzer".to_string(), format!("{logs_dir}/libfuzzer.log")));
-            eprintln!("    Launched libfuzzer");
+            log!("Launched libfuzzer");
         }
 
         eprintln!();
@@ -1091,7 +1164,7 @@ impl Fuzz {
             for (dir, count) in &by_dir {
                 eprintln!("      {count} file(s) in {dir}");
             }
-            eprint!("    Remove them? [Y/n] ");
+            eprint!("Remove these copies? (originals are not affected) [Y/n] ");
             let mut answer = String::new();
             std::io::stdin().read_line(&mut answer)?;
             let answer = answer.trim().to_lowercase();

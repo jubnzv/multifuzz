@@ -29,6 +29,7 @@ pub struct FuzzConfig {
     pub dictionaries: Option<Vec<PathBuf>>,
     pub external_corpus: Option<Vec<PathBuf>>,
     pub external_corpus_recursive: Option<bool>,
+    pub no_colors: Option<bool>,
     /// Honggfuzz config: [fuzz.honggfuzz.worker]. Present = enabled.
     pub honggfuzz: Option<SatelliteEngineConfig>,
     /// Libfuzzer config: [fuzz.libfuzzer.worker]. Present = enabled.

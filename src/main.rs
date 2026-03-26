@@ -95,6 +95,9 @@ pub struct Fuzz {
     /// Libfuzzer worker config from TOML. Present = enabled.
     #[clap(skip)]
     libfuzzer_config: Option<config::WorkerConfig>,
+    /// Disable colored output.
+    #[clap(skip)]
+    no_colors: bool,
     /// In-memory hash set for sync dedup (survives across sync cycles).
     #[clap(skip)]
     sync_hashes: HashSet<u64>,
@@ -145,6 +148,8 @@ impl Fuzz {
         if !self.external_corpus_recursive {
             self.external_corpus_recursive = toml.external_corpus_recursive.unwrap_or(false);
         }
+
+        self.no_colors = toml.no_colors.unwrap_or(false);
 
         // AFL per-worker configs (TOML only)
         let (all_cfg, worker_cfgs) = toml

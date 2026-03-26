@@ -25,6 +25,7 @@ corpus = "../../source_corpus"
 output = "../../output/multi"
 timeout = 10
 sync_interval = 60  # minutes; 0 or omit to disable sync
+# no_colors = true  # disable colored output
 dictionaries = [
     "../../dicts/move.dict",
     "../../dicts/move_rare.dict",
