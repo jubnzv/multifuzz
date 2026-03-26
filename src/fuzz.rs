@@ -240,9 +240,12 @@ impl Fuzz {
         if self.honggfuzz_enabled() {
             self.check_honggfuzz_oversized_files()?;
 
-            // Seed hongg's dynamic_input with corpus files so it starts with
-            // the same seeds as AFL (which may have grown on previous runs).
-            let hongg_input = format!("{}/honggfuzz/dynamic_input", self.output_target());
+            // Copy corpus files into hongg's --input dir so it starts with
+            // the full seed set. This is {HFUZZ_WORKSPACE}/{target}/input/ —
+            // the dir hongg actually reads at startup for corpus minimization.
+            // dynamic_input/ is for runtime sync only (consumed and deleted).
+            let hongg_input = format!("{}/honggfuzz/{}/input", self.output_target(), self.target());
+            fs::create_dir_all(&hongg_input)?;
             let mut seeded = 0usize;
             if let Ok(entries) = fs::read_dir(&corpus) {
                 for entry in entries.flatten() {
@@ -258,7 +261,7 @@ impl Fuzz {
                 }
             }
             if seeded > 0 {
-                eprintln!("    Seeded honggfuzz dynamic_input with {seeded} corpus files");
+                eprintln!("    Seeded honggfuzz input with {seeded} corpus files");
             }
         }
 
@@ -909,52 +912,57 @@ impl Fuzz {
         cargo: &str,
         handles: &mut Vec<Option<process::Child>>,
     ) -> Result<String> {
+        let cfg = self.honggfuzz_config.as_ref().unwrap();
+
+        // Validate: user must not override structural paths.
+        if let Some(env) = &cfg.env {
+            for key in [
+                "HFUZZ_WORKSPACE",
+                "HFUZZ_RUN_ARGS",
+                "CARGO_TARGET_DIR",
+                "HFUZZ_BUILD_ARGS",
+            ] {
+                if env.contains_key(key) {
+                    return Err(anyhow!(
+                        "honggfuzz worker env must not set {key} — managed by multifuzz"
+                    ));
+                }
+            }
+        }
+        if let Some(args) = &cfg.args {
+            for flag in ["--input", "--dynamic_input"] {
+                if args.contains(flag) {
+                    return Err(anyhow!(
+                        "honggfuzz args must not contain {flag} — managed by multifuzz"
+                    ));
+                }
+            }
+            if args.split_whitespace().any(|a| a.starts_with("-o")) {
+                return Err(anyhow!(
+                    "honggfuzz args must not contain -o — managed by multifuzz"
+                ));
+            }
+        }
+
         let corpus = self.corpus_dir();
-        let worker_cfg = self.honggfuzz_config.as_ref();
+        let user_args = cfg.args.as_deref().unwrap_or("");
 
-        let timeout_flag = match self.timeout {
-            Some(t) => format!("-t{t}"),
-            None => String::new(),
-        };
-
-        let dict_flag = if self.dictionaries.is_empty() {
-            String::new()
-        } else if self.dictionaries.len() == 1 {
-            format!("-w{}", self.dictionaries[0].display())
-        } else {
-            format!("-w{}", self.merged_dict.as_ref().unwrap().display())
-        };
-
-        let extra_args = worker_cfg.and_then(|c| c.args.as_deref()).unwrap_or("");
-
-        // The `script` invocation is a trick to get the correct TTY output for
-        // honggfuzz (it requires a valid terminal).
+        // Structural paths only — everything else from user args.
         let hfuzz_run_args = format!(
             "--input={corpus} \
-             -o{}/honggfuzz/corpus \
-             --dynamic_input={}/honggfuzz/dynamic_input \
-             -F{} \
-             {timeout_flag} {dict_flag} {extra_args}",
-            self.output_target(),
-            self.output_target(),
-            self.max_input_size(),
+             -o{output}/honggfuzz/corpus \
+             --dynamic_input={output}/honggfuzz/dynamic_input \
+             {user_args}",
+            output = self.output_target(),
         );
 
-        let hfuzz_workspace = format!("{}/honggfuzz", self.output_target());
-
-        // Collect all env vars for logging.
         let mut env_vars = BTreeMap::new();
         env_vars.insert(
-            "HFUZZ_BUILD_ARGS".to_string(),
-            "--features=multifuzz/honggfuzz".to_string(),
+            "HFUZZ_WORKSPACE".to_string(),
+            format!("{}/honggfuzz", self.output_target()),
         );
-        env_vars.insert(
-            "CARGO_TARGET_DIR".to_string(),
-            "./target/honggfuzz".to_string(),
-        );
-        env_vars.insert("HFUZZ_WORKSPACE".to_string(), hfuzz_workspace.clone());
-        env_vars.insert("HFUZZ_RUN_ARGS".to_string(), hfuzz_run_args.clone());
-        if let Some(user_env) = worker_cfg.and_then(|c| c.env.as_ref()) {
+        env_vars.insert("HFUZZ_RUN_ARGS".to_string(), hfuzz_run_args);
+        if let Some(user_env) = &cfg.env {
             for (k, v) in user_env {
                 env_vars.insert(k.clone(), v.clone());
             }
@@ -991,12 +999,21 @@ impl Fuzz {
     }
 
     fn spawn_libfuzzer(&self, handles: &mut Vec<Option<process::Child>>) -> Result<String> {
-        let worker_cfg = self.libfuzzer_config.as_ref();
+        let cfg = self.libfuzzer_config.as_ref().unwrap();
 
-        // The libfuzzer binary is built with --target=<triple> to isolate
+        // Validate: user must not override structural paths.
+        if let Some(args) = &cfg.args {
+            if args.contains("-artifact_prefix") {
+                return Err(anyhow!(
+                    "libfuzzer args must not contain -artifact_prefix — managed by multifuzz"
+                ));
+            }
+        }
+
         let binary = self.libfuzzer_binary_path();
         let corpus = self.corpus_dir();
 
+        // Structural args only — corpus dirs and crash prefix.
         let mut args = vec![
             format!("{}/libfuzzer/corpus/", self.output_target()),
             corpus,
@@ -1004,34 +1021,16 @@ impl Fuzz {
                 "-artifact_prefix={}/libfuzzer/crashes/",
                 self.output_target()
             ),
-            "-reload=1".to_string(),
-            "-print_final_stats=1".to_string(),
-            "-ignore_crashes=1".to_string(),
-            "-ignore_ooms=1".to_string(),
-            "-ignore_timeouts=1".to_string(),
-            format!("-max_len={}", self.max_input_size()),
         ];
 
-        if let Some(t) = self.timeout {
-            args.push(format!("-timeout={t}"));
-        }
-        if !self.dictionaries.is_empty() {
-            let dict_path = if self.dictionaries.len() == 1 {
-                self.dictionaries[0].clone()
-            } else {
-                self.merged_dict.as_ref().unwrap().clone()
-            };
-            args.push(format!("-dict={}", dict_path.display()));
-        }
-
-        // Append user args from config.
-        if let Some(extra) = worker_cfg.and_then(|c| c.args.as_deref()) {
+        // Append ALL user args (fork, reload, max_len, timeout, dict, etc.).
+        if let Some(extra) = cfg.args.as_deref() {
             args.extend(extra.split_whitespace().map(String::from));
         }
 
-        // Collect env for logging.
-        let env_vars: BTreeMap<String, String> = worker_cfg
-            .and_then(|c| c.env.as_ref())
+        let env_vars: BTreeMap<String, String> = cfg
+            .env
+            .as_ref()
             .map(|e| e.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
             .unwrap_or_default();
 
