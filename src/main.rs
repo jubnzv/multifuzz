@@ -128,7 +128,7 @@ impl Fuzz {
                 .or(toml.max_input_size)
                 .unwrap_or(DEFAULT_MAX_INPUT_SIZE),
         );
-        self.sync_interval = Some(self.sync_interval.or(toml.sync_interval).unwrap_or(60));
+        self.sync_interval = Some(self.sync_interval.or(toml.sync_interval).unwrap_or(0));
 
         // Output defaults
         if self.output.is_none() {
@@ -169,6 +169,9 @@ impl Fuzz {
     }
     pub fn sync_interval(&self) -> u64 {
         self.sync_interval.unwrap()
+    }
+    pub fn sync_enabled(&self) -> bool {
+        self.sync_interval() > 0
     }
     pub fn output(&self) -> &Path {
         self.output.as_deref().unwrap()

@@ -24,6 +24,19 @@ impl Drop for LockGuard {
     }
 }
 
+fn now_hms() -> String {
+    let secs = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    // Convert to local time via libc.
+    let t = unsafe {
+        let t = secs as libc::time_t;
+        *libc::localtime(&t)
+    };
+    format!("{:02}:{:02}:{:02}", t.tm_hour, t.tm_min, t.tm_sec)
+}
+
 /// Print per-worker configuration to stderr.
 fn log_worker(name: &str, env_vars: &BTreeMap<String, String>, cmd: &str) {
     eprintln!("    -- {name} --");
@@ -280,6 +293,39 @@ impl Fuzz {
         for dir in &self.external_corpus {
             eprintln!("    External corpus: {}", dir.display());
         }
+
+        // Sync status.
+        let has_external = !self.external_corpus.is_empty();
+        let has_hongg = self.honggfuzz_enabled();
+        let has_libfuzzer = self.libfuzzer_enabled();
+        let needs_sync = has_external || has_hongg || has_libfuzzer;
+
+        eprintln!();
+        if !self.sync_enabled() {
+            if needs_sync {
+                if has_external {
+                    eprintln!("    WARNING: external corpus configured but sync is disabled (sync_interval = 0)");
+                }
+                if has_hongg || has_libfuzzer {
+                    eprintln!("    WARNING: satellite engines configured but sync is disabled — no cross-engine corpus sharing");
+                }
+            }
+            eprintln!("    Synchronization: disabled");
+        } else if !needs_sync {
+            eprintln!("    Synchronization: disabled (nothing to sync)");
+        } else {
+            let mins = self.sync_interval();
+            eprintln!("    Synchronization every {mins}min:");
+            if has_external && self.afl_enabled() {
+                eprintln!("      external → AFL");
+            }
+            if has_hongg {
+                eprintln!("      AFL → honggfuzz");
+            }
+            if has_libfuzzer {
+                eprintln!("      AFL → libfuzzer");
+            }
+        }
     }
 
     /// Main loop: corpus sync, liveness check.
@@ -304,7 +350,8 @@ impl Fuzz {
             }
 
             // ── corpus sync (every N minutes) ───────────────────────────
-            if last_sync_time.elapsed().as_secs() > self.sync_interval() * 60 {
+            if self.sync_enabled() && last_sync_time.elapsed().as_secs() > self.sync_interval() * 60
+            {
                 let sync_result = self.sync_corpus(last_synced_created_time);
                 match sync_result {
                     Ok(t) => last_synced_created_time = t,
@@ -376,19 +423,25 @@ impl Fuzz {
             let mut sources = external.clone();
             sources.sort();
             sources.dedup();
-            if let Ok((t, n)) = crate::sync::sync_files(
+            eprint!("    [{}] Syncing external → AFL ... ", now_hms());
+            match crate::sync::sync_files(
                 &sources,
                 &afl_queue,
                 last_synced,
                 max_len,
                 &mut self.sync_hashes,
             ) {
-                if n > 0 {
-                    eprintln!("    Sync: {n} files → {}", afl_queue.display());
+                Ok((t, n)) => {
+                    if n > 0 {
+                        eprintln!("{n} files");
+                    } else {
+                        eprintln!("nothing to sync");
+                    }
+                    if t.is_some() {
+                        newest = t;
+                    }
                 }
-                if t.is_some() {
-                    newest = t;
-                }
+                Err(e) => eprintln!("error: {e}"),
             }
         }
 
@@ -399,19 +452,25 @@ impl Fuzz {
                 sources.push(lf_corpus.clone());
             }
             sources.extend(external.iter().cloned());
-            if let Ok((t, n)) = crate::sync::sync_files(
+            eprint!("    [{}] Syncing AFL → honggfuzz ... ", now_hms());
+            match crate::sync::sync_files(
                 &sources,
                 &hongg_input,
                 last_synced,
                 max_len,
                 &mut self.sync_hashes,
             ) {
-                if n > 0 {
-                    eprintln!("    Sync: {n} files → {}", hongg_input.display());
+                Ok((t, n)) => {
+                    if n > 0 {
+                        eprintln!("{n} files");
+                    } else {
+                        eprintln!("nothing to sync");
+                    }
+                    if t.is_some() {
+                        newest = t;
+                    }
                 }
-                if t.is_some() {
-                    newest = t;
-                }
+                Err(e) => eprintln!("error: {e}"),
             }
         }
 
@@ -422,19 +481,25 @@ impl Fuzz {
                 sources.push(hongg_corpus.clone());
             }
             sources.extend(external.iter().cloned());
-            if let Ok((t, n)) = crate::sync::sync_files(
+            eprint!("    [{}] Syncing AFL → libfuzzer ... ", now_hms());
+            match crate::sync::sync_files(
                 &sources,
                 &lf_corpus,
                 last_synced,
                 max_len,
                 &mut self.sync_hashes,
             ) {
-                if n > 0 {
-                    eprintln!("    Sync: {n} files → {}", lf_corpus.display());
+                Ok((t, n)) => {
+                    if n > 0 {
+                        eprintln!("{n} files");
+                    } else {
+                        eprintln!("nothing to sync");
+                    }
+                    if t.is_some() {
+                        newest = t;
+                    }
                 }
-                if t.is_some() {
-                    newest = t;
-                }
+                Err(e) => eprintln!("error: {e}"),
             }
         }
 

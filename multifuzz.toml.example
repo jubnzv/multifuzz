@@ -24,7 +24,7 @@ target = "multifuzz_source_fuzzer"
 corpus = "../../source_corpus"
 output = "../../output/multi"
 timeout = 10
-sync_interval = 60
+sync_interval = 60  # minutes; 0 or omit to disable sync
 dictionaries = [
     "../../dicts/move.dict",
     "../../dicts/move_rare.dict",
