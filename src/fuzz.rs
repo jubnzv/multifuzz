@@ -230,10 +230,10 @@ impl Fuzz {
 
         let loop_start = Instant::now();
 
-        let mut processes = self.spawn_fuzzers()?;
+        let (mut processes, worker_info) = self.spawn_fuzzers()?;
         self.print_launch_info();
 
-        self.run_loop(&mut processes)?;
+        self.run_loop(&mut processes, &worker_info)?;
 
         stop_fuzzers(&mut processes)?;
 
@@ -282,10 +282,15 @@ impl Fuzz {
         }
     }
 
-    /// Main loop: crash collection, corpus sync, liveness check.
-    fn run_loop(&mut self, processes: &mut [Option<process::Child>]) -> Result<()> {
+    /// Main loop: corpus sync, liveness check.
+    fn run_loop(
+        &mut self,
+        processes: &mut [Option<process::Child>],
+        worker_info: &[(String, String)],
+    ) -> Result<()> {
         let mut last_synced_created_time: Option<SystemTime> = None;
         let mut last_sync_time = Instant::now();
+        let mut reported_dead: Vec<bool> = vec![false; processes.len()];
 
         loop {
             if STOP.load(Ordering::Relaxed) {
@@ -314,10 +319,26 @@ impl Fuzz {
             }
 
             // ── liveness check ──────────────────────────────────────────
-            let all_dead = processes.iter_mut().all(|slot| {
-                slot.as_mut()
-                    .is_none_or(|ch| ch.try_wait().unwrap_or(None).is_some())
-            });
+            let mut all_dead = true;
+            for (i, slot) in processes.iter_mut().enumerate() {
+                if let Some(child) = slot.as_mut() {
+                    match child.try_wait() {
+                        Ok(Some(status)) if !reported_dead[i] => {
+                            reported_dead[i] = true;
+                            let (name, log) = &worker_info[i];
+                            let code = status
+                                .code()
+                                .map(|c| c.to_string())
+                                .unwrap_or_else(|| "signal".to_string());
+                            eprintln!("    {name} exited (code={code}), log: {log}");
+                        }
+                        Ok(None) => {
+                            all_dead = false;
+                        }
+                        _ => {}
+                    }
+                }
+            }
             if all_dead {
                 break;
             }
@@ -436,7 +457,9 @@ impl Fuzz {
         }
     }
 
-    fn spawn_fuzzers(&mut self) -> Result<Vec<Option<process::Child>>> {
+    /// Spawn all configured fuzzers. Returns (handles, worker_info) where
+    /// worker_info[i] = (name, log_path) for handles[i].
+    fn spawn_fuzzers(&mut self) -> Result<(Vec<Option<process::Child>>, Vec<(String, String)>)> {
         let afl_count = self.afl_worker_count();
         let has_hongg = self.honggfuzz_enabled();
         let has_libfuzzer = self.libfuzzer_enabled();
@@ -446,46 +469,48 @@ impl Fuzz {
         }
 
         let mut handles: Vec<Option<process::Child>> = vec![];
+        let mut worker_info: Vec<(String, String)> = vec![];
         let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
+        let logs_dir = format!("{}/logs", self.output_target());
 
         if afl_count > 0 {
             fs::create_dir_all(format!("{}/afl", self.output_target()))?;
             self.spawn_afl(&cargo, afl_count, &mut handles)?;
+            for i in 0..afl_count {
+                let name = if i == 0 {
+                    "AFL master".to_string()
+                } else {
+                    format!("AFL slave{i}")
+                };
+                let log = if i == 0 {
+                    format!("{logs_dir}/afl.log")
+                } else {
+                    format!("{logs_dir}/afl_{i}.log")
+                };
+                worker_info.push((name, log));
+            }
             eprintln!("    Launched AFL++ ({afl_count} instances)");
         }
 
         if has_hongg {
             self.spawn_honggfuzz(&cargo, &mut handles)?;
+            worker_info.push(("honggfuzz".to_string(), format!("{logs_dir}/honggfuzz.log")));
             eprintln!("    Launched honggfuzz");
         }
 
         if has_libfuzzer {
             self.spawn_libfuzzer(&mut handles)?;
+            worker_info.push(("libfuzzer".to_string(), format!("{logs_dir}/libfuzzer.log")));
             eprintln!("    Launched libfuzzer");
         }
 
-        // Print log paths.
-        let logs_dir = format!("{}/logs", self.output_target());
         eprintln!();
         eprintln!("    Log files:");
-        if afl_count > 0 {
-            for i in 0..afl_count {
-                let name = if i == 0 {
-                    "afl.log".to_string()
-                } else {
-                    format!("afl_{i}.log")
-                };
-                eprintln!("      tail -f {logs_dir}/{name}");
-            }
-        }
-        if has_hongg {
-            eprintln!("      tail -f {logs_dir}/honggfuzz.log");
-        }
-        if has_libfuzzer {
-            eprintln!("      tail -f {logs_dir}/libfuzzer.log");
+        for (_, log) in &worker_info {
+            eprintln!("      tail -f {log}");
         }
 
-        Ok(handles)
+        Ok((handles, worker_info))
     }
 
     /// Compute the AFL++ input directory (resume-aware).
