@@ -1,4 +1,5 @@
 mod build;
+mod clean;
 mod config;
 mod fuzz;
 mod run;
@@ -29,6 +30,8 @@ pub enum Command {
     Build(Build),
     /// Fuzz a target
     Fuzz(Box<Fuzz>),
+    /// Clean up fuzzing artifacts (lockfile, temp files, output)
+    Clean(Clean),
     /// Run specific inputs through the runner binary
     Run(Run),
 }
@@ -190,6 +193,13 @@ impl Fuzz {
 }
 
 #[derive(clap::Args)]
+pub struct Clean {
+    /// Path to TOML config file (default: ./multifuzz.toml if present)
+    #[clap(short = 'c', long = "config", value_name = "FILE")]
+    config: Option<PathBuf>,
+}
+
+#[derive(clap::Args)]
 pub struct Run {
     /// Target binary name
     #[clap(value_name = "TARGET")]
@@ -210,6 +220,7 @@ fn main() -> Result<()> {
             args.build().context("Failed to build the fuzzers")
         }
         Command::Fuzz(mut args) => args.fuzz().context("Failure running fuzzers"),
+        Command::Clean(args) => args.clean().context("Failure cleaning artifacts"),
         Command::Run(args) => args.run().context("Failure running inputs"),
     }
 }
