@@ -125,7 +125,6 @@ pub fn load_config(explicit_path: Option<&Path>) -> Result<ConfigFile> {
             if !default.exists() {
                 return Ok(ConfigFile::default());
             }
-            eprintln!("    Loading config from ./multifuzz.toml");
             default
         }
     };

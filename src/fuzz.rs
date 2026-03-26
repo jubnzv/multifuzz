@@ -175,7 +175,12 @@ impl Fuzz {
     // ── public entry point ──────────────────────────────────────────────
 
     pub fn fuzz(&mut self) -> Result<()> {
-        // Load TOML config and merge with CLI args.
+        let config_path = self
+            .config
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "./multifuzz.toml".to_string());
+        eprintln!("    Loading config from {config_path}");
         self.resolve_config()?;
 
         // target is required
