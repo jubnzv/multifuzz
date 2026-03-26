@@ -352,7 +352,16 @@ impl Fuzz {
             // ── corpus sync (every N minutes) ───────────────────────────
             if self.sync_enabled() && last_sync_time.elapsed().as_secs() > self.sync_interval() * 60
             {
-                let sync_result = self.sync_corpus(last_synced_created_time);
+                let hongg_alive = worker_info
+                    .iter()
+                    .zip(reported_dead.iter())
+                    .any(|((name, _), &dead)| name == "honggfuzz" && !dead);
+                let libfuzzer_alive = worker_info
+                    .iter()
+                    .zip(reported_dead.iter())
+                    .any(|((name, _), &dead)| name == "libfuzzer" && !dead);
+                let sync_result =
+                    self.sync_corpus(last_synced_created_time, hongg_alive, libfuzzer_alive);
                 match sync_result {
                     Ok(t) => last_synced_created_time = t,
                     Err(e) => {
@@ -396,7 +405,12 @@ impl Fuzz {
 
     // ── corpus sync ─────────────────────────────────────────────────────
 
-    fn sync_corpus(&mut self, last_synced: Option<SystemTime>) -> Result<Option<SystemTime>> {
+    fn sync_corpus(
+        &mut self,
+        last_synced: Option<SystemTime>,
+        hongg_alive: bool,
+        libfuzzer_alive: bool,
+    ) -> Result<Option<SystemTime>> {
         let max_len = self.max_input_size() as u64;
         let mut newest = last_synced;
 
@@ -446,7 +460,7 @@ impl Fuzz {
         }
 
         // 2. AFL + libfuzzer + external → honggfuzz dynamic_input.
-        if self.honggfuzz_enabled() {
+        if self.honggfuzz_enabled() && hongg_alive {
             let mut sources = vec![afl_queue.clone()];
             if self.libfuzzer_enabled() {
                 sources.push(lf_corpus.clone());
@@ -475,7 +489,7 @@ impl Fuzz {
         }
 
         // 3. AFL + honggfuzz + external → libfuzzer corpus.
-        if self.libfuzzer_enabled() {
+        if self.libfuzzer_enabled() && libfuzzer_alive {
             let mut sources = vec![afl_queue.clone()];
             if self.honggfuzz_enabled() {
                 sources.push(hongg_corpus.clone());
