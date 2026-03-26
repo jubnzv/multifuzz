@@ -678,7 +678,7 @@ impl Fuzz {
         }
 
         if has_hongg {
-            self.spawn_honggfuzz(&cargo, &mut handles)?;
+            self.spawn_honggfuzz(&mut handles)?;
             worker_info.push(("honggfuzz".to_string(), format!("{logs_dir}/honggfuzz.log")));
             log!("Launched honggfuzz");
         }
@@ -982,21 +982,21 @@ impl Fuzz {
         Ok(cmds)
     }
 
-    fn spawn_honggfuzz(
-        &self,
-        cargo: &str,
-        handles: &mut Vec<Option<process::Child>>,
-    ) -> Result<String> {
+    fn spawn_honggfuzz(&self, handles: &mut Vec<Option<process::Child>>) -> Result<String> {
         let cfg = self.honggfuzz_config.as_ref().unwrap();
+
+        let command = cfg.command.as_deref().ok_or_else(|| {
+            anyhow!(
+                "[fuzz.honggfuzz.worker] requires 'command'. Example:\n\
+                 command = \"CARGO_TARGET_DIR=./target/honggfuzz HFUZZ_BUILD_ARGS='--features=multifuzz/honggfuzz' \
+                 script --flush --quiet -c 'cargo hfuzz run {}' /dev/null\"",
+                self.target()
+            )
+        })?;
 
         // Validate: user must not override structural paths.
         if let Some(env) = &cfg.env {
-            for key in [
-                "HFUZZ_WORKSPACE",
-                "HFUZZ_RUN_ARGS",
-                "CARGO_TARGET_DIR",
-                "HFUZZ_BUILD_ARGS",
-            ] {
+            for key in ["HFUZZ_WORKSPACE", "HFUZZ_RUN_ARGS", "CARGO_TARGET_DIR"] {
                 if env.contains_key(key) {
                     return Err(anyhow!(
                         "honggfuzz worker env must not set {key} — managed by multifuzz"
@@ -1033,6 +1033,10 @@ impl Fuzz {
 
         let mut env_vars = BTreeMap::new();
         env_vars.insert(
+            "CARGO_TARGET_DIR".to_string(),
+            "./target/honggfuzz".to_string(),
+        );
+        env_vars.insert(
             "HFUZZ_WORKSPACE".to_string(),
             format!("{}/honggfuzz", self.output_target()),
         );
@@ -1043,23 +1047,13 @@ impl Fuzz {
             }
         }
 
-        let cmd_str = format!(
-            "script --flush --quiet -c \"{cargo} hfuzz run {}\" /dev/null",
-            self.target(),
-        );
-        log_worker("honggfuzz", &env_vars, &cmd_str);
+        log_worker("honggfuzz", &env_vars, command);
 
         let hfuzz_log = File::create(format!("{}/logs/honggfuzz.log", self.output_target()))?;
         let hfuzz_log_clone = hfuzz_log.try_clone()?;
 
-        let mut cmd = process::Command::new("script");
-        cmd.args([
-            "--flush",
-            "--quiet",
-            "-c",
-            &format!("{cargo} hfuzz run {}", self.target()),
-            "/dev/null",
-        ]);
+        let mut cmd = process::Command::new("sh");
+        cmd.arg("-c").arg(command);
         for (k, v) in &env_vars {
             cmd.env(k, v);
         }
@@ -1070,7 +1064,7 @@ impl Fuzz {
 
         handles.push(Some(cmd.spawn()?));
 
-        Ok(cmd_str)
+        Ok(command.to_string())
     }
 
     fn spawn_libfuzzer(&self, handles: &mut Vec<Option<process::Child>>) -> Result<String> {

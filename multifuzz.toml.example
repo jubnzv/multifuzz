@@ -95,11 +95,14 @@ AFL_CUSTOM_MUTATOR_LIBRARY = "~/Sources/AFLplusplus/custom_mutators/grammar_muta
 #
 # Multifuzz manages structural paths (corpus dirs, sync dirs, crash prefix).
 # DO NOT set: --input, -o, --dynamic_input, HFUZZ_WORKSPACE, HFUZZ_RUN_ARGS,
-# HFUZZ_BUILD_ARGS, CARGO_TARGET_DIR, -artifact_prefix.
+# -artifact_prefix.
+# CARGO_TARGET_DIR is set by multifuzz (./target/honggfuzz).
 # Everything else goes in args.
 
-# Honggfuzz. User args are appended to HFUZZ_RUN_ARGS after structural paths.
+# Honggfuzz. command = full shell command to run honggfuzz.
+# args = appended to HFUZZ_RUN_ARGS after structural paths (--input, -o, --dynamic_input).
 # [fuzz.honggfuzz.worker]
+# command = "HFUZZ_BUILD_ARGS='--features=multifuzz/honggfuzz' script --flush --quiet -c 'cargo hfuzz run multifuzz_source_fuzzer' /dev/null"
 # args = "-n1 -F8192 -t5 -w ../../dicts/move.dict"
 
 # Libfuzzer. User args are appended after structural args (corpus dirs, -artifact_prefix).
