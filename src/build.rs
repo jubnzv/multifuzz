@@ -3,15 +3,16 @@ use anyhow::{anyhow, Context, Result};
 use std::process;
 
 fn default_afl_cmd() -> String {
-    "AFL_QUIET=1 cargo afl build --features=multifuzz/afl --target-dir=target/afl".to_string()
+    "AFL_QUIET=1 cargo afl build --release --features=multifuzz/afl --target-dir=target/afl"
+        .to_string()
 }
 
 fn default_afl_cmplog_cmd() -> String {
-    "AFL_QUIET=1 AFL_LLVM_CMPLOG=1 cargo afl build --features=multifuzz/afl --target-dir=target/afl-cmplog".to_string()
+    "AFL_QUIET=1 AFL_LLVM_CMPLOG=1 cargo afl build --release --features=multifuzz/afl --target-dir=target/afl-cmplog".to_string()
 }
 
 fn default_honggfuzz_cmd() -> String {
-    "CARGO_TARGET_DIR=./target/honggfuzz HFUZZ_BUILD_ARGS='--features=multifuzz/honggfuzz' cargo hfuzz build-debug".to_string()
+    "CARGO_TARGET_DIR=./target/honggfuzz HFUZZ_BUILD_ARGS='--features=multifuzz/honggfuzz' cargo hfuzz build".to_string()
 }
 
 fn default_libfuzzer_cmd() -> String {

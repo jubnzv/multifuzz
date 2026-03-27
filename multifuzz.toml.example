@@ -1,53 +1,48 @@
-# Example multifuzz config.
+# multifuzz configuration.
 # Copy to ./multifuzz.toml (or pass --config <path>).
-#
-# Equivalent to:
-#   AFL_SKIP_CPUFREQ=1 cargo run --release --manifest-path ~/Dev/multifuzz/Cargo.toml \
-#     -- fuzz multifuzz_source_fuzzer --sync-interval 60 \
-#     -i ../../source_corpus -o ../../output/multi \
-#     -x ../../dicts/move.dict -x ../../dicts/move_rare.dict -x ../../dicts/crash.dict \
-#     -t 10 --external-corpus /tmp/move-corpus
-#
-# With this config in place, the invocation simplifies to:
-#   AFL_SKIP_CPUFREQ=1 cargo run --release -- fuzz
 
+# ── Build ────────────────────────────────────────────────────────────────
+# Build commands executed via `sh -c`. Defaults shown below.
+# `multifuzz build` always runs them; `multifuzz fuzz` skips by default.
 [build]
-# always_build = true  # Run build commands before fuzzing (default: false)
-# Defaults shown below. Uncomment to override.
-# afl = "AFL_QUIET=1 cargo afl build --features=multifuzz/afl --target-dir=target/afl"
-# afl_cmplog = "AFL_QUIET=1 AFL_LLVM_CMPLOG=1 cargo afl build --features=multifuzz/afl --target-dir=target/afl-cmplog"
-# honggfuzz = "CARGO_TARGET_DIR=./target/honggfuzz HFUZZ_BUILD_ARGS='--features=multifuzz/honggfuzz' cargo hfuzz build-debug"
+# always_build = true  # Build before fuzzing (default: false)
+# afl = "AFL_QUIET=1 cargo afl build --release --features=multifuzz/afl --target-dir=target/afl"
+# afl_cmplog = "AFL_QUIET=1 AFL_LLVM_CMPLOG=1 cargo afl build --release --features=multifuzz/afl --target-dir=target/afl-cmplog"
+# honggfuzz = "CARGO_TARGET_DIR=./target/honggfuzz HFUZZ_BUILD_ARGS='--features=multifuzz/honggfuzz' cargo hfuzz build"
 # libfuzzer = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=4 -Cllvm-args=-sanitizer-coverage-trace-compares -Cllvm-args=-sanitizer-coverage-inline-8bit-counters -Cllvm-args=-sanitizer-coverage-pc-table' cargo build --release --target=x86_64-unknown-linux-gnu --features=multifuzz/libfuzzer --target-dir=target/libfuzzer"
 
+# ── Fuzz ─────────────────────────────────────────────────────────────────
 [fuzz]
-target = "multifuzz_source_fuzzer"
-corpus = "../../source_corpus"
-output = "../../output/multi"
-timeout = 10
-sync_interval = 60  # minutes; 0 or omit to disable sync
-# no_colors = true  # disable colored output
-dictionaries = [
+target = "multifuzz_source_fuzzer"        # Binary name of the fuzz harness (required)
+corpus = "../../source_corpus"            # Initial seed corpus directory
+output = "../../output/multi"             # Output directory (default: ./output)
+timeout = 10                              # Per-exec timeout in seconds
+max_input_size = 8192                     # Max input size in bytes (default: 8192)
+sync_interval = 60                        # Corpus sync interval in minutes; 0 or omit to disable
+# no_colors = true                        # Disable colored output (default: false)
+dictionaries = [                          # Dictionary files
     "../../dicts/move.dict",
     "../../dicts/move_rare.dict",
     "../../dicts/crash.dict",
 ]
-external_corpus = ["/tmp/move-corpus"]
+external_corpus = ["/tmp/move-corpus"]    # External corpus dirs imported during sync
+# external_corpus_recursive = true        # Recurse into external corpus subdirs (default: false)
 
-# Per-worker AFL++ configuration.
-# NO hardcoded env defaults — everything is explicit in the config.
+# ── AFL++ workers ────────────────────────────────────────────────────────
+# Number of workers = number of [fuzz.afl.workerN] sections (worker0 = master).
+# [fuzz.afl.all.env] sets base env vars for EVERY AFL worker.
+# [fuzz.afl.workerN] overrides for specific worker N.
+# Worker env = all.env + workerN.env merged (worker wins on conflict).
 #
-# [fuzz.afl.all.env]   — base env vars applied to EVERY AFL worker.
-# [fuzz.afl.workerN]   — per-worker overrides (0=main, 1+=secondary).
+# Per-worker fields:
+#   args    = "..."   Extra CLI args (power schedule, cmplog, old queue, etc.)
+#   command = "..."   Full command override (executed via sh -c; replaces auto-generated)
+#   env     = {...}   Env vars for this worker
 #
-# Worker env = all.env merged with workerN.env (worker wins on conflict).
-# At startup, the resolved env + command is printed per worker.
-#
-# Optional per-worker fields:
-#   args = "..."     # Extra CLI args (power schedule, cmplog, etc.)
-#   command = "..."  # Full command override (executed via sh -c)
-#
-# The auto-generated command is MINIMAL: -M/-S, -i, -o, -t, -G, dicts.
-# Everything else (power schedule, cmplog, old queue) goes in args.
+# The auto-generated command is MINIMAL: -M/-S, -i, -o, -t, -G, dicts, -F (sync).
+# Everything else goes in args.
+# If any worker has a cmplog -l flag, the afl_cmplog binary is built automatically
+# and -c is injected into that worker's command.
 
 [fuzz.afl.all.env]
 AFL_AUTORESUME = "1"
@@ -60,7 +55,7 @@ AFL_NO_WARN_INSTABILITY = "1"
 AFL_FUZZER_STATS_UPDATE_INTERVAL = "10"
 AFL_IGNORE_SEED_PROBLEMS = "1"
 
-# Main instance.
+# Master instance.
 [fuzz.afl.worker0]
 args = "-pexplore"
 
@@ -75,7 +70,7 @@ args = "-pfast"
 AFL_CUSTOM_MUTATOR_LIBRARY = "~/Sources/AFLplusplus/custom_mutators/radamsa/radamsa-mutator.so"
 AFL_CUSTOM_MUTATOR_ONLY = "1"
 
-# Secondary with cmplog.
+# Secondary with cmplog (triggers cmplog binary build + auto -c injection).
 [fuzz.afl.worker2]
 args = "-pcoe -l2a"
 
@@ -86,25 +81,33 @@ args = "-pexploit"
 [fuzz.afl.worker3.env]
 AFL_CUSTOM_MUTATOR_LIBRARY = "~/Sources/AFLplusplus/custom_mutators/grammar_mutator/grammar_mutator.so"
 
-# Fully custom command example (uncomment to use):
+# Full command override example (uncomment to use):
 # [fuzz.afl.worker3]
 # command = "cargo afl fuzz -Sgrammar -i ../../source_corpus -o ../../output/multi/afl -pexplore -G8192 ./target/afl/debug/multifuzz_source_fuzzer"
 
-# ── Satellite engines ──────────────────────────────────────────────────
+# ── Honggfuzz ────────────────────────────────────────────────────────────
 # Present = enabled. Absent = disabled.
 #
-# Multifuzz manages structural paths (corpus dirs, sync dirs, crash prefix).
-# DO NOT set: --input, -o, --dynamic_input, HFUZZ_WORKSPACE, HFUZZ_RUN_ARGS,
-# -artifact_prefix.
-# CARGO_TARGET_DIR is set by multifuzz (./target/honggfuzz).
-# Everything else goes in args.
-
-# Honggfuzz. command = full shell command to run honggfuzz.
-# args = appended to HFUZZ_RUN_ARGS after structural paths (--input, -o, --dynamic_input).
+# command = full shell command to launch honggfuzz (required).
+# args    = appended to HFUZZ_RUN_ARGS after structural paths.
+# env     = extra env vars passed to the process.
+#
+# Multifuzz manages (DO NOT set in env/args):
+#   HFUZZ_WORKSPACE, HFUZZ_RUN_ARGS, CARGO_TARGET_DIR,
+#   --input, -o, --dynamic_input
+#
 # [fuzz.honggfuzz.worker]
 # command = "HFUZZ_BUILD_ARGS='--features=multifuzz/honggfuzz' script --flush --quiet -c 'cargo hfuzz run multifuzz_source_fuzzer' /dev/null"
 # args = "-n1 -F8192 -t5 -w ../../dicts/move.dict"
 
-# Libfuzzer. User args are appended after structural args (corpus dirs, -artifact_prefix).
+# ── Libfuzzer ────────────────────────────────────────────────────────────
+# Present = enabled. Absent = disabled.
+#
+# args = appended after structural args (corpus dirs, -artifact_prefix).
+# env  = extra env vars passed to the process.
+#
+# Multifuzz manages (DO NOT set in args):
+#   corpus dir positional args, -artifact_prefix
+#
 # [fuzz.libfuzzer.worker]
 # args = "-fork=1 -reload=1 -max_len=8192 -timeout=5 -ignore_crashes=1 -ignore_ooms=1"

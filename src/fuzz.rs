@@ -191,7 +191,7 @@ impl Fuzz {
             .as_ref()
             .and_then(|c| c.build.as_ref())
             .and_then(|b| b.afl.as_deref())
-            .unwrap_or("");
+            .unwrap_or("--release");
         let profile = if cmd.contains("--release") {
             "release"
         } else {
@@ -206,7 +206,7 @@ impl Fuzz {
             .as_ref()
             .and_then(|c| c.build.as_ref())
             .and_then(|b| b.afl_cmplog.as_deref())
-            .unwrap_or("");
+            .unwrap_or("--release");
         let profile = if cmd.contains("--release") {
             "release"
         } else {
