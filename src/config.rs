@@ -4,12 +4,14 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ConfigFile {
     pub build: Option<BuildConfig>,
     pub fuzz: Option<FuzzConfig>,
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct BuildConfig {
     pub always_build: Option<bool>,
     pub afl: Option<String>,
@@ -19,6 +21,7 @@ pub struct BuildConfig {
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct FuzzConfig {
     pub target: Option<String>,
     pub corpus: Option<PathBuf>,
@@ -40,12 +43,14 @@ pub struct FuzzConfig {
 }
 
 #[derive(Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct SatelliteEngineConfig {
     pub worker: Option<WorkerConfig>,
 }
 
 /// Worker config shared by ALL engines (AFL, honggfuzz, libfuzzer).
 #[derive(Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct WorkerConfig {
     /// Full command override. When set, replaces all auto-generated args.
     /// Executed via `sh -c`.
