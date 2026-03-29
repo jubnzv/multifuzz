@@ -502,11 +502,9 @@ impl Fuzz {
                                 .code()
                                 .map(|c| c.to_string())
                                 .unwrap_or_else(|| "signal".to_string());
-                            log!(
-                                "{}{name} exited (code={code}){}, log: {log}",
-                                c_bold_red(),
-                                c_reset()
-                            );
+                            log!("{}{name} exited (code={code}){}", c_bold_red(), c_reset());
+                            eprintln!("  log: {log}");
+                            eprintln!("  restart: multifuzz worker start {name}");
                         }
                         Ok(None) => {
                             all_dead = false;
