@@ -742,8 +742,8 @@ impl Fuzz {
         eprintln!();
         eprintln!();
         eprintln!("Log files:");
-        for (_, log) in &worker_info {
-            eprintln!("  tail -f {log}");
+        for (name, log) in &worker_info {
+            eprintln!("  [{name}] tail -f {log}");
         }
 
         Ok((handles, worker_info))
