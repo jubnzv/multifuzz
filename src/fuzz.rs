@@ -12,6 +12,26 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
+/// Extract `--target-dir` value from a build command string.
+fn extract_target_dir(cmd: &str) -> Option<String> {
+    // --target-dir=path
+    if let Some(pos) = cmd.find("--target-dir=") {
+        let rest = &cmd[pos + 13..];
+        let end = rest.find(' ').unwrap_or(rest.len());
+        return Some(rest[..end].to_string());
+    }
+    // --target-dir path
+    let parts: Vec<&str> = cmd.split_whitespace().collect();
+    for (i, part) in parts.iter().enumerate() {
+        if *part == "--target-dir" {
+            if let Some(next) = parts.get(i + 1) {
+                return Some(next.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// (process handles, worker names + log paths)
 type SpawnResult = (Vec<Option<process::Child>>, Vec<(String, String)>);
 
@@ -197,7 +217,8 @@ impl Fuzz {
         } else {
             "debug"
         };
-        format!("./target/afl/{profile}/{}", self.target())
+        let target_dir = extract_target_dir(cmd).unwrap_or_else(|| "./target/afl".into());
+        format!("{target_dir}/{profile}/{}", self.target())
     }
 
     fn afl_cmplog_binary_path(&self) -> String {
@@ -212,7 +233,8 @@ impl Fuzz {
         } else {
             "debug"
         };
-        format!("./target/afl-cmplog/{profile}/{}", self.target())
+        let target_dir = extract_target_dir(cmd).unwrap_or_else(|| "./target/afl-cmplog".into());
+        format!("{target_dir}/{profile}/{}", self.target())
     }
 
     fn libfuzzer_binary_path(&self) -> String {
@@ -228,7 +250,9 @@ impl Fuzz {
         } else {
             "debug"
         };
-        format!("./target/libfuzzer/{host}/{profile}/{}", self.target())
+        let target_dir =
+            extract_target_dir(cmd).unwrap_or_else(|| format!("./target/libfuzzer/{host}"));
+        format!("{target_dir}/{profile}/{}", self.target())
     }
 
     // ── public entry point ──────────────────────────────────────────────
