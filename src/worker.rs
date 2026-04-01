@@ -11,9 +11,33 @@ pub struct WorkerEntry {
 }
 
 const STATE_FILE: &str = ".multifuzz.state";
+const PID_FILE: &str = ".multifuzz.pid";
 
 fn state_path(output_target: &str) -> PathBuf {
     PathBuf::from(format!("{output_target}/{STATE_FILE}"))
+}
+
+fn pid_path(output_target: &str) -> PathBuf {
+    PathBuf::from(format!("{output_target}/{PID_FILE}"))
+}
+
+/// Write orchestrator PID so `worker start` can signal it.
+pub fn write_pid(output_target: &str) {
+    let _ = fs::write(pid_path(output_target), std::process::id().to_string());
+}
+
+/// Remove orchestrator PID file.
+pub fn remove_pid(output_target: &str) {
+    let _ = fs::remove_file(pid_path(output_target));
+}
+
+/// Read orchestrator PID.
+pub fn read_pid(output_target: &str) -> Option<u32> {
+    fs::read_to_string(pid_path(output_target))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 fn resolve_output_target(config_path: Option<&Path>) -> Result<String> {
@@ -64,6 +88,16 @@ pub fn write_state(output_target: &str, entries: &[(String, u32, String)]) {
         .collect::<Vec<_>>()
         .join("\n");
     let _ = fs::write(path, content + "\n");
+}
+
+/// Send SIGUSR1 to the orchestrator so it picks up new state.
+#[allow(dead_code)]
+pub fn notify_orchestrator(output_target: &str) {
+    if let Some(pid) = read_pid(output_target) {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGUSR1);
+        }
+    }
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -133,7 +167,9 @@ impl Worker {
                 // TODO: spawn worker from config.
                 // This requires refactoring spawn logic out of Fuzz methods
                 // into standalone functions that can be called from here.
-                // For now, error with instructions.
+                // After spawning, update state and notify the orchestrator:
+                //   write_state(&output_target, &updated_entries);
+                //   notify_orchestrator(&output_target);
                 return Err(anyhow!(
                     "`worker start` is not yet implemented. Use `multifuzz fuzz` to start all workers."
                 ));

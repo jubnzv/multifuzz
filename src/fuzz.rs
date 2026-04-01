@@ -126,6 +126,7 @@ fn log_worker(name: &str, env_vars: &BTreeMap<String, String>, cmd: &str) {
 }
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static RELOAD: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigint(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
@@ -137,6 +138,10 @@ extern "C" fn handle_sigint(_: libc::c_int) {
             26,
         )
     };
+}
+
+extern "C" fn handle_sigusr1(_: libc::c_int) {
+    RELOAD.store(true, Ordering::Relaxed);
 }
 
 use std::os::unix::process::CommandExt;
@@ -356,6 +361,12 @@ impl Fuzz {
             libc::sigemptyset(&mut sa.sa_mask);
             sa.sa_flags = 0;
             libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+
+            let mut sa_usr1: libc::sigaction = std::mem::zeroed();
+            sa_usr1.sa_sigaction = handle_sigusr1 as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut sa_usr1.sa_mask);
+            sa_usr1.sa_flags = libc::SA_RESTART;
+            libc::sigaction(libc::SIGUSR1, &sa_usr1, std::ptr::null_mut());
         }
 
         let loop_start = Instant::now();
@@ -371,6 +382,7 @@ impl Fuzz {
             })
             .collect();
         crate::worker::write_state(&self.output_target(), &state_entries);
+        crate::worker::write_pid(&self.output_target());
 
         self.print_launch_info();
         log!("Fuzzing campaign started");
@@ -378,6 +390,7 @@ impl Fuzz {
         self.run_loop(&mut processes, &worker_info)?;
 
         stop_fuzzers(&mut processes)?;
+        crate::worker::remove_pid(&self.output_target());
 
         let elapsed = loop_start.elapsed().as_secs();
         let days = elapsed / 86400;
@@ -475,6 +488,10 @@ impl Fuzz {
         let mut last_synced_created_time: Option<SystemTime> = None;
         let mut last_sync_time = Instant::now();
         let mut reported_dead: Vec<bool> = vec![false; processes.len()];
+        let mut known_pids: HashSet<u32> = processes
+            .iter()
+            .filter_map(|p| p.as_ref().map(|ch| ch.id()))
+            .collect();
 
         loop {
             if STOP.load(Ordering::Relaxed) {
@@ -485,6 +502,24 @@ impl Fuzz {
 
             if STOP.load(Ordering::Relaxed) {
                 break;
+            }
+
+            // ── new worker detection (SIGUSR1) ─────────────────────────
+            if RELOAD.load(Ordering::Relaxed) {
+                RELOAD.store(false, Ordering::Relaxed);
+                let current = crate::worker::read_state(&self.output_target());
+                for entry in &current {
+                    if entry.pid != 0 && known_pids.insert(entry.pid) {
+                        log!(
+                            "{}Worker attached: {}{}",
+                            c_bold_green(),
+                            entry.name,
+                            c_reset()
+                        );
+                        eprintln!("  pid: {}", entry.pid);
+                        eprintln!("  log: {}", entry.log);
+                    }
+                }
             }
 
             // ── corpus sync (every N minutes) ───────────────────────────
