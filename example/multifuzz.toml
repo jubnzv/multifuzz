@@ -7,6 +7,7 @@
 
 [fuzz]
 target = "example_crash"
+# Relative paths are resolved from this config file's directory, not CWD.
 corpus = "./corpus"
 output = "./output/multi"
 timeout = 5

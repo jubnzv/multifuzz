@@ -117,7 +117,19 @@ pub fn resolve_afl_env(
     env
 }
 
+/// Rebase a relative path so it is relative to `base` instead of CWD.
+fn rebase(base: &Path, p: PathBuf) -> PathBuf {
+    if p.is_absolute() {
+        p
+    } else {
+        base.join(p)
+    }
+}
+
 /// Load config from explicit path, `./multifuzz.toml`, or return default.
+///
+/// Relative paths inside the config are resolved relative to the config
+/// file's parent directory, NOT the current working directory.
 pub fn load_config(explicit_path: Option<&Path>) -> Result<ConfigFile> {
     let path = match explicit_path {
         Some(p) => {
@@ -135,9 +147,36 @@ pub fn load_config(explicit_path: Option<&Path>) -> Result<ConfigFile> {
         }
     };
 
+    // Canonicalize so that the base dir is absolute even when the config
+    // path itself was given as a relative path.
+    let path = path
+        .canonicalize()
+        .with_context(|| format!("canonicalizing config path {}", path.display()))?;
+    let base = path
+        .parent()
+        .ok_or_else(|| anyhow!("config path has no parent dir: {}", path.display()))?;
+
     let contents =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let cfg: ConfigFile =
+    let mut cfg: ConfigFile =
         toml::from_str(&contents).with_context(|| format!("parsing {}", path.display()))?;
+
+    // Rebase all relative paths in [fuzz] so they resolve from the config
+    // file's directory rather than from the process CWD.
+    if let Some(fuzz) = &mut cfg.fuzz {
+        if let Some(p) = fuzz.corpus.take() {
+            fuzz.corpus = Some(rebase(base, p));
+        }
+        if let Some(p) = fuzz.output.take() {
+            fuzz.output = Some(rebase(base, p));
+        }
+        if let Some(dicts) = fuzz.dictionaries.take() {
+            fuzz.dictionaries = Some(dicts.into_iter().map(|p| rebase(base, p)).collect());
+        }
+        if let Some(dirs) = fuzz.external_corpus.take() {
+            fuzz.external_corpus = Some(dirs.into_iter().map(|p| rebase(base, p)).collect());
+        }
+    }
+
     Ok(cfg)
 }
