@@ -141,7 +141,9 @@ pub fn load_config(explicit_path: Option<&Path>) -> Result<ConfigFile> {
         None => {
             let default = PathBuf::from("multifuzz.toml");
             if !default.exists() {
-                return Ok(ConfigFile::default());
+                return Err(anyhow!(
+                    "Config file not found: multifuzz.toml (use --config to specify a path)"
+                ));
             }
             default
         }
