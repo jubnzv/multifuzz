@@ -164,15 +164,26 @@ impl Worker {
                     }
                 }
 
-                // TODO: spawn worker from config.
-                // This requires refactoring spawn logic out of Fuzz methods
-                // into standalone functions that can be called from here.
-                // After spawning, update state and notify the orchestrator:
-                //   write_state(&output_target, &updated_entries);
-                //   notify_orchestrator(&output_target);
-                return Err(anyhow!(
-                    "`worker start` is not yet implemented. Use `multifuzz fuzz` to start all workers."
-                ));
+                let mut fuzz = crate::Fuzz::from_config(self.config.as_deref())?;
+                let (child, canonical_name, log_path) = fuzz.spawn_single_worker(name)?;
+                let pid = child.id();
+                // Let Child drop — Rust does not kill child on drop, and
+                // process_group(0) ensures it survives after we exit.
+                drop(child);
+
+                // Update state: keep live entries, add the new one.
+                let mut new_entries: Vec<(String, u32, String)> = entries
+                    .iter()
+                    .filter(|e| e.name != canonical_name && pid_alive(e.pid))
+                    .map(|e| (e.name.clone(), e.pid, e.log.clone()))
+                    .collect();
+                new_entries.push((canonical_name.clone(), pid, log_path.clone()));
+                write_state(&output_target, &new_entries);
+
+                notify_orchestrator(&output_target);
+
+                eprintln!("Started {} (pid={})", canonical_name, pid);
+                eprintln!("  log: {log_path}");
             }
         }
 

@@ -175,7 +175,53 @@ fn merge_dicts(dicts: &[PathBuf], output_dir: &str) -> Result<PathBuf> {
     Ok(merged_path)
 }
 
+/// Which engine a worker name maps to.
+enum WorkerKind {
+    AflMaster,
+    AflSlave(u32),
+    Honggfuzz,
+    Libfuzzer,
+}
+
 impl Fuzz {
+    /// Create a resolved `Fuzz` from config alone (no CLI args).
+    /// Used by `worker start` to reconstruct spawn context.
+    pub fn from_config(config_path: Option<&Path>) -> Result<Self> {
+        let mut fuzz = Fuzz {
+            target: None,
+            config: config_path.map(|p| p.to_path_buf()),
+            corpus: None,
+            output: None,
+            dictionaries: vec![],
+            merged_dict: None,
+            next_afl_job_num: 0,
+            timeout: None,
+            max_input_size: None,
+            sync_interval: None,
+            external_corpus: vec![],
+            external_corpus_recursive: false,
+            afl_all_config: None,
+            afl_worker_configs: Default::default(),
+            honggfuzz_config: None,
+            libfuzzer_config: None,
+            no_colors: false,
+            sync_hashes: Default::default(),
+        };
+        fuzz.resolve_config()?;
+
+        if let Some(output) = &fuzz.output {
+            if output.exists() {
+                fuzz.output = Some(output.canonicalize()?);
+            }
+        }
+
+        if fuzz.target.is_none() {
+            return Err(anyhow!("No target specified in config"));
+        }
+
+        Ok(fuzz)
+    }
+
     /// Resolved corpus directory path.
     fn corpus_dir(&self) -> String {
         match &self.corpus {
@@ -764,13 +810,15 @@ impl Fuzz {
         }
 
         if has_hongg {
-            self.spawn_honggfuzz(&mut handles)?;
+            let (child, _cmd) = self.spawn_honggfuzz_worker()?;
+            handles.push(Some(child));
             worker_info.push(("honggfuzz".to_string(), format!("{logs_dir}/honggfuzz.log")));
             log!("Launched honggfuzz");
         }
 
         if has_libfuzzer {
-            self.spawn_libfuzzer(&mut handles)?;
+            let (child, _cmd) = self.spawn_libfuzzer_worker()?;
+            handles.push(Some(child));
             worker_info.push(("libfuzzer".to_string(), format!("{logs_dir}/libfuzzer.log")));
             log!("Launched libfuzzer");
         }
@@ -783,6 +831,100 @@ impl Fuzz {
         }
 
         Ok((handles, worker_info))
+    }
+
+    /// Resolve a (possibly partial) worker name to a `WorkerKind` and canonical name.
+    fn resolve_worker_kind(&self, query: &str) -> Result<(WorkerKind, String)> {
+        let mut valid_names: Vec<(WorkerKind, String)> = vec![];
+        let afl_count = self.afl_worker_count();
+        for i in 0..afl_count {
+            if i == 0 {
+                valid_names.push((WorkerKind::AflMaster, "AFL master".to_string()));
+            } else {
+                valid_names.push((WorkerKind::AflSlave(i), format!("AFL slave{i}")));
+            }
+        }
+        if self.honggfuzz_enabled() {
+            valid_names.push((WorkerKind::Honggfuzz, "honggfuzz".to_string()));
+        }
+        if self.libfuzzer_enabled() {
+            valid_names.push((WorkerKind::Libfuzzer, "libfuzzer".to_string()));
+        }
+
+        let q = query.to_lowercase();
+        for (kind, name) in &valid_names {
+            let n = name.to_lowercase();
+            if n == q || n.contains(&q) {
+                // Move out of the matched entry. We need to reconstruct kind since it's not Copy.
+                let canonical = name.clone();
+                let kind = match kind {
+                    WorkerKind::AflMaster => WorkerKind::AflMaster,
+                    WorkerKind::AflSlave(i) => WorkerKind::AflSlave(*i),
+                    WorkerKind::Honggfuzz => WorkerKind::Honggfuzz,
+                    WorkerKind::Libfuzzer => WorkerKind::Libfuzzer,
+                };
+                return Ok((kind, canonical));
+            }
+        }
+
+        let names: Vec<&str> = valid_names.iter().map(|(_, n)| n.as_str()).collect();
+        Err(anyhow!(
+            "Unknown worker '{}'. Valid workers: {}",
+            query,
+            names.join(", ")
+        ))
+    }
+
+    /// Spawn a single worker by name. Returns (child, canonical_name, log_path).
+    pub fn spawn_single_worker(&mut self, name: &str) -> Result<(process::Child, String, String)> {
+        let (kind, canonical) = self.resolve_worker_kind(name)?;
+        let logs_dir = format!("{}/logs", self.output_target());
+        fs::create_dir_all(&logs_dir)?;
+
+        // Ensure engine-specific output dirs exist.
+        match &kind {
+            WorkerKind::AflMaster | WorkerKind::AflSlave(_) => {
+                fs::create_dir_all(format!("{}/afl", self.output_target()))?;
+            }
+            WorkerKind::Honggfuzz => {
+                fs::create_dir_all(format!("{}/honggfuzz/corpus", self.output_target()))?;
+                fs::create_dir_all(format!("{}/honggfuzz/dynamic_input", self.output_target()))?;
+            }
+            WorkerKind::Libfuzzer => {
+                fs::create_dir_all(format!("{}/libfuzzer/corpus", self.output_target()))?;
+                fs::create_dir_all(format!("{}/libfuzzer/crashes", self.output_target()))?;
+            }
+        }
+
+        // Merge dicts if needed.
+        if self.dictionaries.len() > 1 && self.merged_dict.is_none() {
+            self.merged_dict = Some(merge_dicts(&self.dictionaries, &self.output_target())?);
+        }
+
+        let cargo = env::var("CARGO").unwrap_or_else(|_| String::from("cargo"));
+
+        let (child, log_path) = match &kind {
+            WorkerKind::AflMaster => {
+                self.next_afl_job_num = self.afl_worker_count();
+                let (child, _cmd) = self.spawn_afl_master(&cargo)?;
+                (child, format!("{logs_dir}/afl.log"))
+            }
+            WorkerKind::AflSlave(n) => {
+                self.next_afl_job_num = self.afl_worker_count();
+                let (child, _cmd) = self.spawn_afl_secondary(&cargo, *n)?;
+                (child, format!("{logs_dir}/afl_{n}.log"))
+            }
+            WorkerKind::Honggfuzz => {
+                let (child, _cmd) = self.spawn_honggfuzz_worker()?;
+                (child, format!("{logs_dir}/honggfuzz.log"))
+            }
+            WorkerKind::Libfuzzer => {
+                let (child, _cmd) = self.spawn_libfuzzer_worker()?;
+                (child, format!("{logs_dir}/libfuzzer.log"))
+            }
+        };
+
+        Ok((child, canonical, log_path))
     }
 
     /// Compute the AFL++ input directory (resume-aware).
@@ -947,128 +1089,128 @@ impl Fuzz {
         Ok((cmd.spawn()?, command.to_string()))
     }
 
+    /// Spawn the AFL++ master instance (job_num=0).
+    fn spawn_afl_master(&self, cargo: &str) -> Result<(process::Child, String)> {
+        let job_num: u32 = 0;
+        let worker_cfg = self.afl_worker_configs.get(&job_num);
+
+        // Custom command: delegate to sh -c.
+        if let Some(command) = worker_cfg.and_then(|c| c.command.as_deref()) {
+            return self.spawn_afl_custom(job_num, command);
+        }
+
+        let afl_input_dir = self.afl_input_dir()?;
+        let dict_flags = self.afl_dict_flags();
+        let fuzzer_name = String::from("-Mmaster");
+
+        let honggfuzz_sync_flag = if self.honggfuzz_enabled() {
+            format!("-F{}/honggfuzz/corpus", self.output_target())
+        } else {
+            String::new()
+        };
+        let libfuzzer_sync_flag = if self.libfuzzer_enabled() {
+            format!("-F{}/libfuzzer/corpus", self.output_target())
+        } else {
+            String::new()
+        };
+
+        let timeout_flag = match self.timeout {
+            Some(t) => format!("-t{}", t * 1000),
+            None => String::new(),
+        };
+        let max_len_flag = format!("-G{}", self.max_input_size());
+
+        let log_destination = || -> Stdio {
+            File::create(format!("{}/logs/afl.log", self.output_target()))
+                .unwrap()
+                .into()
+        };
+
+        let target_path = self.afl_binary_path();
+
+        // Minimal auto-generated args. User adds power schedule etc. via `args`.
+        let mut afl_args: Vec<String> = [
+            "afl".to_string(),
+            "fuzz".to_string(),
+            fuzzer_name,
+            format!("-i{afl_input_dir}"),
+            format!("-o{}/afl", self.output_target()),
+            honggfuzz_sync_flag,
+            libfuzzer_sync_flag,
+            timeout_flag,
+            max_len_flag,
+        ]
+        .into_iter()
+        .filter(|a| !a.is_empty())
+        .collect();
+
+        // Auto-inject cmplog binary path if worker uses -l (cmplog level).
+        if let Some(extra) = worker_cfg.and_then(|c| c.args.as_deref()) {
+            let has_cmplog = extra
+                .split_whitespace()
+                .any(|a| a.starts_with("-l") && a.len() > 2 && a.as_bytes()[2].is_ascii_digit());
+            if has_cmplog {
+                afl_args.push(format!("-c{}", self.afl_cmplog_binary_path()));
+            }
+            afl_args.extend(extra.split_whitespace().map(|s| s.to_string()));
+        }
+
+        // Resolve env: all config + worker config merged, no hardcoded defaults.
+        let env_vars = config::resolve_afl_env(&self.afl_all_config, worker_cfg);
+        for (k, v) in &env_vars {
+            if k == "AFL_TMPDIR" {
+                let _ = std::fs::create_dir_all(v);
+            }
+        }
+
+        let mut cmd_parts: Vec<&str> = vec![cargo];
+        cmd_parts.extend(afl_args.iter().map(|s| s.as_str()));
+        cmd_parts.extend(dict_flags.iter().map(|s| s.as_str()));
+        cmd_parts.push(&target_path);
+        let cmd_str = cmd_parts.join(" ");
+        log_worker("AFL master", &env_vars, &cmd_str);
+
+        let mut cmd = process::Command::new(cargo);
+        cmd.args(&afl_args)
+            .args(&dict_flags)
+            .arg(&target_path)
+            .stdout(log_destination())
+            .stderr(log_destination())
+            .process_group(0);
+        for (k, v) in &env_vars {
+            cmd.env(k, v);
+        }
+
+        Ok((cmd.spawn()?, cmd_str))
+    }
+
     fn spawn_afl(
         &mut self,
         cargo: &str,
         afl_jobs: u32,
         handles: &mut Vec<Option<process::Child>>,
     ) -> Result<Vec<String>> {
-        let afl_input_dir = self.afl_input_dir()?;
-        let dict_flags = self.afl_dict_flags();
-
         let mut cmds = Vec::new();
 
         // Set next_afl_job_num early so spawn_afl_secondary sees total count.
         self.next_afl_job_num = afl_jobs;
 
-        // Spawn main instance (job_num=0) — unique -M flag, -F sync flags.
-        {
-            let job_num: u32 = 0;
-            let worker_cfg = self.afl_worker_configs.get(&job_num);
-
-            // Custom command: delegate to sh -c.
-            if let Some(command) = worker_cfg.and_then(|c| c.command.as_deref()) {
-                let (child, cmd_str) = self.spawn_afl_custom(job_num, command)?;
-                cmds.push(cmd_str.clone());
-                handles.push(Some(child));
-            } else {
-                let fuzzer_name = String::from("-Mmaster");
-
-                let honggfuzz_sync_flag = if self.honggfuzz_enabled() {
-                    format!("-F{}/honggfuzz/corpus", self.output_target())
-                } else {
-                    String::new()
-                };
-                let libfuzzer_sync_flag = if self.libfuzzer_enabled() {
-                    format!("-F{}/libfuzzer/corpus", self.output_target())
-                } else {
-                    String::new()
-                };
-
-                let timeout_flag = match self.timeout {
-                    Some(t) => format!("-t{}", t * 1000),
-                    None => String::new(),
-                };
-                let max_len_flag = format!("-G{}", self.max_input_size());
-
-                let log_destination = || -> Stdio {
-                    File::create(format!("{}/logs/afl.log", self.output_target()))
-                        .unwrap()
-                        .into()
-                };
-
-                let target_path = self.afl_binary_path();
-
-                // Minimal auto-generated args. User adds power schedule etc. via `args`.
-                let mut afl_args: Vec<String> = [
-                    "afl".to_string(),
-                    "fuzz".to_string(),
-                    fuzzer_name.clone(),
-                    format!("-i{afl_input_dir}"),
-                    format!("-o{}/afl", self.output_target()),
-                    honggfuzz_sync_flag.clone(),
-                    libfuzzer_sync_flag.clone(),
-                    timeout_flag.clone(),
-                    max_len_flag.clone(),
-                ]
-                .into_iter()
-                .filter(|a| !a.is_empty())
-                .collect();
-
-                // Auto-inject cmplog binary path if worker uses -l (cmplog level).
-                if let Some(extra) = worker_cfg.and_then(|c| c.args.as_deref()) {
-                    let has_cmplog = extra.split_whitespace().any(|a| {
-                        a.starts_with("-l") && a.len() > 2 && a.as_bytes()[2].is_ascii_digit()
-                    });
-                    if has_cmplog {
-                        afl_args.push(format!("-c{}", self.afl_cmplog_binary_path()));
-                    }
-                    afl_args.extend(extra.split_whitespace().map(|s| s.to_string()));
-                }
-
-                // Resolve env: all config + worker config merged, no hardcoded defaults.
-                let env_vars = config::resolve_afl_env(&self.afl_all_config, worker_cfg);
-                for (k, v) in &env_vars {
-                    if k == "AFL_TMPDIR" {
-                        let _ = std::fs::create_dir_all(v);
-                    }
-                }
-
-                let mut cmd_parts: Vec<&str> = vec![cargo];
-                cmd_parts.extend(afl_args.iter().map(|s| s.as_str()));
-                cmd_parts.extend(dict_flags.iter().map(|s| s.as_str()));
-                cmd_parts.push(&target_path);
-                let main_cmd_str = cmd_parts.join(" ");
-                cmds.push(main_cmd_str.clone());
-                log_worker("AFL master", &env_vars, &main_cmd_str);
-
-                let mut cmd = process::Command::new(cargo);
-                cmd.args(&afl_args)
-                    .args(&dict_flags)
-                    .arg(&target_path)
-                    .stdout(log_destination())
-                    .stderr(log_destination())
-                    .process_group(0);
-                for (k, v) in &env_vars {
-                    cmd.env(k, v);
-                }
-
-                handles.push(Some(cmd.spawn()?));
-            }
-        }
+        // Spawn main instance (job_num=0).
+        let (child, cmd_str) = self.spawn_afl_master(cargo)?;
+        cmds.push(cmd_str);
+        handles.push(Some(child));
 
         // Spawn secondaries (job_num 1..afl_jobs)
         for job_num in 1..afl_jobs {
             let (child, sec_cmd_str) = self.spawn_afl_secondary(cargo, job_num)?;
-            cmds.push(sec_cmd_str.clone());
-
+            cmds.push(sec_cmd_str);
             handles.push(Some(child));
         }
 
         Ok(cmds)
     }
 
-    fn spawn_honggfuzz(&self, handles: &mut Vec<Option<process::Child>>) -> Result<String> {
+    fn spawn_honggfuzz_worker(&self) -> Result<(process::Child, String)> {
         let cfg = self.honggfuzz_config.as_ref().unwrap();
 
         let command = cfg.command.as_deref().ok_or_else(|| {
@@ -1148,12 +1290,10 @@ impl Fuzz {
             .stdout(hfuzz_log_clone)
             .process_group(0);
 
-        handles.push(Some(cmd.spawn()?));
-
-        Ok(command.to_string())
+        Ok((cmd.spawn()?, command.to_string()))
     }
 
-    fn spawn_libfuzzer(&self, handles: &mut Vec<Option<process::Child>>) -> Result<String> {
+    fn spawn_libfuzzer_worker(&self) -> Result<(process::Child, String)> {
         let cfg = self.libfuzzer_config.as_ref().unwrap();
 
         // Validate: user must not override structural paths.
@@ -1204,11 +1344,11 @@ impl Fuzz {
             cmd.env(k, v);
         }
 
-        handles.push(Some(cmd.spawn().with_context(|| {
-            format!("Failed to spawn libfuzzer binary: {binary}")
-        })?));
+        let child = cmd
+            .spawn()
+            .with_context(|| format!("Failed to spawn libfuzzer binary: {binary}"))?;
 
-        Ok(cmd_str)
+        Ok((child, cmd_str))
     }
 
     /// Check for oversized files that would crash honggfuzz and prompt for removal.
