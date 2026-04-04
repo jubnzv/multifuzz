@@ -126,19 +126,31 @@ fn log_worker(name: &str, env_vars: &BTreeMap<String, String>, cmd: &str) {
 }
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static FORCE_KILL: AtomicBool = AtomicBool::new(false);
 static RELOAD: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn handle_sigint(_: libc::c_int) {
-    STOP.store(true, Ordering::Relaxed);
     // write() is async-signal-safe; eprintln!/log! are not.
-    let _ = unsafe {
-        libc::write(
-            2,
-            b"\nGracefully terminating (may take a moment depending on your AFL++ settings)...\n"
-                .as_ptr() as *const libc::c_void,
-            79,
-        )
-    };
+    if STOP.load(Ordering::Relaxed) {
+        FORCE_KILL.store(true, Ordering::Relaxed);
+        let _ = unsafe {
+            libc::write(
+                2,
+                b"\nForce-killing all workers (SIGKILL)...\n".as_ptr() as *const libc::c_void,
+                40,
+            )
+        };
+    } else {
+        STOP.store(true, Ordering::Relaxed);
+        let _ = unsafe {
+            libc::write(
+                2,
+                b"\nGracefully terminating (press Ctrl-C again to force-kill)...\n".as_ptr()
+                    as *const libc::c_void,
+                61,
+            )
+        };
+    }
 }
 
 extern "C" fn handle_sigusr1(_: libc::c_int) {
@@ -1445,8 +1457,13 @@ fn kill_subprocesses_recursively(pid: &str) -> Result<()> {
 }
 
 /// Block until every process group in `pgids` is empty.
+/// If FORCE_KILL is set (second Ctrl-C), escalates to SIGKILL immediately.
 fn wait_for_process_groups(pgids: &[i32]) {
     loop {
+        if FORCE_KILL.load(Ordering::Relaxed) {
+            sigkill_process_groups(pgids);
+            return;
+        }
         let any_alive = pgids.iter().any(|&pgid| {
             // signal 0: no signal sent, just checks if any process in the group exists.
             // Returns -1 / ESRCH when the group is empty.
@@ -1459,6 +1476,15 @@ fn wait_for_process_groups(pgids: &[i32]) {
     }
 }
 
+/// Send SIGKILL to every process group.
+fn sigkill_process_groups(pgids: &[i32]) {
+    for &pgid in pgids {
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+}
+
 fn stop_fuzzers(processes: &mut [Option<process::Child>]) -> Result<()> {
     // Collect process group IDs (equal to child PIDs due to process_group(0)).
     let pgids: Vec<i32> = processes
@@ -1466,10 +1492,14 @@ fn stop_fuzzers(processes: &mut [Option<process::Child>]) -> Result<()> {
         .filter_map(|slot| slot.as_ref().map(|ch| ch.id() as i32))
         .collect();
 
-    // SIGTERM all process trees.
-    for slot in processes.iter_mut() {
-        if let Some(child) = slot.as_mut() {
-            kill_process_tree(child.id())?;
+    if FORCE_KILL.load(Ordering::Relaxed) {
+        sigkill_process_groups(&pgids);
+    } else {
+        // SIGTERM all process trees.
+        for slot in processes.iter_mut() {
+            if let Some(child) = slot.as_mut() {
+                kill_process_tree(child.id())?;
+            }
         }
     }
 
