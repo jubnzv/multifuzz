@@ -134,8 +134,9 @@ extern "C" fn handle_sigint(_: libc::c_int) {
     let _ = unsafe {
         libc::write(
             2,
-            b"\nGracefully terminating...\n".as_ptr() as *const libc::c_void,
-            26,
+            b"\nGracefully terminating (may take a moment depending on your AFL++ settings)...\n"
+                .as_ptr() as *const libc::c_void,
+            79,
         )
     };
 }
@@ -1303,17 +1304,47 @@ fn kill_subprocesses_recursively(pid: &str) -> Result<()> {
     Ok(())
 }
 
+/// Block until every process group in `pgids` is empty.
+fn wait_for_process_groups(pgids: &[i32]) {
+    loop {
+        let any_alive = pgids.iter().any(|&pgid| {
+            // signal 0: no signal sent, just checks if any process in the group exists.
+            // Returns -1 / ESRCH when the group is empty.
+            unsafe { libc::kill(-pgid, 0) == 0 }
+        });
+        if !any_alive {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn stop_fuzzers(processes: &mut [Option<process::Child>]) -> Result<()> {
+    // Collect process group IDs (equal to child PIDs due to process_group(0)).
+    let pgids: Vec<i32> = processes
+        .iter()
+        .filter_map(|slot| slot.as_ref().map(|ch| ch.id() as i32))
+        .collect();
+
+    // SIGTERM all process trees.
     for slot in processes.iter_mut() {
         if let Some(child) = slot.as_mut() {
             kill_process_tree(child.id())?;
         }
     }
+
+    // Wait for direct children.
     for slot in processes.iter_mut() {
         if let Some(child) = slot.as_mut() {
             let _ = child.wait();
         }
     }
+
+    // Wait for ALL processes in every group to exit (grandchildren included).
+    // This prevents orphaned afl-fuzz / fork-server processes from holding
+    // flocks on the output directories.
+    wait_for_process_groups(&pgids);
+
     for slot in processes.iter_mut() {
         *slot = None;
     }
