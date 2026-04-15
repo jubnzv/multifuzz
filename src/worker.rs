@@ -2,6 +2,8 @@ use crate::{config, Worker, WorkerCommand, DEFAULT_OUTPUT_DIR};
 use anyhow::{anyhow, Result};
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::thread;
+use std::time::Duration;
 
 /// One entry in the state file.
 pub struct WorkerEntry {
@@ -104,6 +106,34 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// Stop a worker process group: SIGTERM, wait up to ~5s, then SIGKILL if needed.
+/// No-op if the pid is already dead.
+fn stop_worker(pid: u32, name: &str) {
+    if !pid_alive(pid) {
+        return;
+    }
+    eprintln!("Stopping {name} (pid={pid})");
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGTERM);
+    }
+    for _ in 0..100 {
+        if !pid_alive(pid) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!("{name} (pid={pid}) did not exit; sending SIGKILL");
+    unsafe {
+        libc::kill(-(pid as i32), libc::SIGKILL);
+    }
+    for _ in 0..40 {
+        if !pid_alive(pid) {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn find_worker<'a>(entries: &'a [WorkerEntry], query: &str) -> Option<&'a WorkerEntry> {
     let q = query.to_lowercase();
     entries
@@ -163,30 +193,43 @@ impl Worker {
                         ));
                     }
                 }
-
-                let mut fuzz = crate::Fuzz::from_config(self.config.as_deref())?;
-                let (child, canonical_name, log_path) = fuzz.spawn_single_worker(name)?;
-                let pid = child.id();
-                // Let Child drop — Rust does not kill child on drop, and
-                // process_group(0) ensures it survives after we exit.
-                drop(child);
-
-                // Update state: keep live entries, add the new one.
-                let mut new_entries: Vec<(String, u32, String)> = entries
-                    .iter()
-                    .filter(|e| e.name != canonical_name && pid_alive(e.pid))
-                    .map(|e| (e.name.clone(), e.pid, e.log.clone()))
-                    .collect();
-                new_entries.push((canonical_name.clone(), pid, log_path.clone()));
-                write_state(&output_target, &new_entries);
-
-                notify_orchestrator(&output_target);
-
-                eprintln!("Started {} (pid={})", canonical_name, pid);
-                eprintln!("  log: {log_path}");
+                self.do_start(name, &output_target, entries)?;
+            }
+            WorkerCommand::Restart { name } => {
+                let entries = read_state(&output_target);
+                if let Some(entry) = find_worker(&entries, name) {
+                    stop_worker(entry.pid, &entry.name);
+                } else {
+                    eprintln!("No running instance of '{name}'; starting fresh.");
+                }
+                self.do_start(name, &output_target, entries)?;
             }
         }
 
+        Ok(())
+    }
+
+    fn do_start(&self, name: &str, output_target: &str, entries: Vec<WorkerEntry>) -> Result<()> {
+        let mut fuzz = crate::Fuzz::from_config(self.config.as_deref())?;
+        let (child, canonical_name, log_path) = fuzz.spawn_single_worker(name)?;
+        let pid = child.id();
+        // Let Child drop — Rust does not kill child on drop, and
+        // process_group(0) ensures it survives after we exit.
+        drop(child);
+
+        // Update state: keep live entries, add the new one.
+        let mut new_entries: Vec<(String, u32, String)> = entries
+            .iter()
+            .filter(|e| e.name != canonical_name && pid_alive(e.pid))
+            .map(|e| (e.name.clone(), e.pid, e.log.clone()))
+            .collect();
+        new_entries.push((canonical_name.clone(), pid, log_path.clone()));
+        write_state(output_target, &new_entries);
+
+        notify_orchestrator(output_target);
+
+        eprintln!("Started {} (pid={})", canonical_name, pid);
+        eprintln!("  log: {log_path}");
         Ok(())
     }
 }

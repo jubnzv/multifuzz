@@ -33,7 +33,7 @@ pub enum Command {
     Fuzz(Box<Fuzz>),
     /// Clean up fuzzing artifacts (lockfile, temp files, output)
     Clean(Clean),
-    /// Manage individual workers (ps, start, kill)
+    /// Manage individual workers (ps, start, restart, kill)
     Worker(Worker),
     /// Run specific inputs through the runner binary
     Run(Run),
@@ -215,13 +215,18 @@ pub struct Worker {
 pub enum WorkerCommand {
     /// List running and stopped workers
     Ps,
-    /// Start or restart a worker by name
+    /// Start a worker by name
     Start {
         /// Worker name (partial match OK, e.g. "slave1", "hongg")
         name: String,
     },
     /// Kill a worker by name (SIGTERM)
     Kill {
+        /// Worker name (partial match OK, e.g. "slave1", "hongg")
+        name: String,
+    },
+    /// Restart a worker by name (stop if running, then start)
+    Restart {
         /// Worker name (partial match OK, e.g. "slave1", "hongg")
         name: String,
     },
