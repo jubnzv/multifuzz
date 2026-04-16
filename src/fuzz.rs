@@ -804,6 +804,7 @@ impl Fuzz {
 
         if afl_count > 0 {
             fs::create_dir_all(format!("{}/afl", self.output_target()))?;
+            let afl_start = handles.len();
             self.spawn_afl(&cargo, afl_count, &mut handles)?;
             for i in 0..afl_count {
                 let name = if i == 0 {
@@ -818,21 +819,30 @@ impl Fuzz {
                 };
                 worker_info.push((name, log));
             }
-            log!("Launched AFL++ ({afl_count} instances)");
+            let pids: Vec<String> = handles[afl_start..afl_start + afl_count as usize]
+                .iter()
+                .filter_map(|h| h.as_ref().map(|c| c.id().to_string()))
+                .collect();
+            log!(
+                "Launched AFL++ ({afl_count} instances, pids=[{}])",
+                pids.join(", ")
+            );
         }
 
         if has_hongg {
             let (child, _cmd) = self.spawn_honggfuzz_worker()?;
+            let pid = child.id();
             handles.push(Some(child));
             worker_info.push(("honggfuzz".to_string(), format!("{logs_dir}/honggfuzz.log")));
-            log!("Launched honggfuzz");
+            log!("Launched honggfuzz (pid={pid})");
         }
 
         if has_libfuzzer {
             let (child, _cmd) = self.spawn_libfuzzer_worker()?;
+            let pid = child.id();
             handles.push(Some(child));
             worker_info.push(("libfuzzer".to_string(), format!("{logs_dir}/libfuzzer.log")));
-            log!("Launched libfuzzer");
+            log!("Launched libfuzzer (pid={pid})");
         }
 
         eprintln!();
