@@ -616,13 +616,15 @@ impl Fuzz {
                             reported_dead[i] = true;
                             state_changed = true;
                             let (name, log) = &worker_info[i];
-                            let code = status
-                                .code()
-                                .map(|c| c.to_string())
-                                .unwrap_or_else(|| "signal".to_string());
-                            log!("{}{name} exited (code={code}){}", c_bold_red(), c_reset());
+                            use std::os::unix::process::ExitStatusExt;
+                            let code = match (status.code(), status.signal()) {
+                                (Some(c), _) => format!("code={c}"),
+                                (None, Some(s)) => format!("signal={s}"),
+                                _ => "unknown".to_string(),
+                            };
+                            log!("{}{name} exited ({code}){}", c_bold_red(), c_reset());
                             eprintln!("  log: {log}");
-                            eprintln!("  restart: multifuzz worker start {name}");
+                            eprintln!("  restart: multifuzz worker start \"{name}\"");
                         }
                         Ok(None) => {
                             all_dead = false;
