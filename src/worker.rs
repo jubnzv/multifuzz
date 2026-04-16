@@ -106,10 +106,18 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
-/// Stop a worker process group: SIGTERM, wait up to ~5s, then SIGKILL if needed.
-/// No-op if the pid is already dead.
+/// True while any process remains in the group with PGID = `pid`.
+/// Workers are spawned with process_group(0), so PGID == leader PID.
+fn pgroup_alive(pid: u32) -> bool {
+    unsafe { libc::kill(-(pid as i32), 0) == 0 }
+}
+
+/// Stop a worker process group: SIGTERM, wait up to ~5s for the entire
+/// group (forkservers, fork-mode children, grandchildren) to exit, then
+/// SIGKILL and wait up to another ~5s. Only returns once the group is
+/// truly empty, so callers can safely respawn without flock conflicts.
 fn stop_worker(pid: u32, name: &str) {
-    if !pid_alive(pid) {
+    if !pgroup_alive(pid) {
         return;
     }
     eprintln!("Stopping {name} (pid={pid})");
@@ -117,7 +125,7 @@ fn stop_worker(pid: u32, name: &str) {
         libc::kill(-(pid as i32), libc::SIGTERM);
     }
     for _ in 0..100 {
-        if !pid_alive(pid) {
+        if !pgroup_alive(pid) {
             return;
         }
         thread::sleep(Duration::from_millis(50));
@@ -126,12 +134,13 @@ fn stop_worker(pid: u32, name: &str) {
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
-    for _ in 0..40 {
-        if !pid_alive(pid) {
+    for _ in 0..100 {
+        if !pgroup_alive(pid) {
             return;
         }
         thread::sleep(Duration::from_millis(50));
     }
+    eprintln!("{name} (pid={pid}) still has live processes after SIGKILL");
 }
 
 fn find_worker<'a>(entries: &'a [WorkerEntry], query: &str) -> Option<&'a WorkerEntry> {
