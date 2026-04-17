@@ -4,15 +4,15 @@ Multi-engine fuzzing orchestrator for Rust. Runs AFL++, honggfuzz, and libfuzzer
 
 **Features:**
 1. **Unified Rust API** to set up a harness for all three fuzzers (see below)
-2. **Corpus synchronization** between engines with dynamic input handling. Leverages built-in fuzzer features for synchronization.
-3. **Single configuration file** for all fuzzer instances — everything is 100% explicit; the orchestrator does not introduce any implicit configuration options or environment variables
+2. **Corpus synchronization** between engines with dynamic input handling, leveraging built-in fuzzer features.
+3. **Single configuration file** for all fuzzer instances — everything is 100% explicit; the orchestrator introduces no implicit options or environment variables
 4. **No overhead**: no UI, no extra tools
 
-Simplifies Rust harness implementation and replaces Makefiles/custom scripts for running complex fuzzing campaigns.
+multifuzz simplifies writing Rust harnesses and replaces Makefiles/custom scripts for complex fuzzing campaigns.
 
 ## Installation
 
-Install the fuzzing toolchains you are going to use:
+Install the fuzzing toolchains you need:
 
 ```sh
 cargo install cargo-afl
@@ -86,7 +86,7 @@ AFL_FINAL_SYNC = "1"
 AFL_CUSTOM_MUTATOR_LIBRARY = "/path/to/mutator.so"
 ```
 
-### 3. Use CLI to start and manage the campaign
+### 3. Use the CLI to start and manage the campaign
 
 ```sh
 # Build all fuzzer binaries
