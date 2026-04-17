@@ -111,17 +111,26 @@ macro_rules! log_inline {
     }};
 }
 
-/// Print per-worker configuration to stderr.
+/// Quote a value for safe shell paste: single-quotes if it contains anything
+/// beyond a conservative safe set.
+fn shell_quote(value: &str) -> String {
+    let safe = value
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b",._/:=+-@".contains(&b));
+    if !value.is_empty() && safe {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+/// Print per-worker configuration to stderr as a pasteable bash command.
 fn log_worker(name: &str, env_vars: &BTreeMap<String, String>, cmd: &str) {
     eprintln!("-- {name} --");
-    if env_vars.is_empty() {
-        eprintln!("(no env vars configured)");
-    } else {
-        for (k, v) in env_vars {
-            eprintln!("env {k}={v}");
-        }
+    for (k, v) in env_vars {
+        eprintln!("env {k}={} \\", shell_quote(v));
     }
-    eprintln!("$ {cmd}");
+    eprintln!("{cmd}");
     eprintln!();
 }
 
