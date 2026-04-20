@@ -118,7 +118,9 @@ pub fn resolve_afl_env(
 }
 
 /// Rebase a relative path so it is relative to `base` instead of CWD.
+/// Expands leading `~` to the home directory before rebasing.
 fn rebase(base: &Path, p: PathBuf) -> PathBuf {
+    let p = PathBuf::from(shellexpand::tilde(&p.to_string_lossy()).into_owned());
     if p.is_absolute() {
         p
     } else {
